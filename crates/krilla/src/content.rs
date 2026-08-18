@@ -35,8 +35,9 @@ use crate::resource::{Resource, ResourceDictionaryBuilder};
 use crate::serialize::{MaybeDeviceColorSpace, SerializeContext};
 use crate::stream::Stream;
 use crate::text::group::{use_text_spanner, GlyphGroup, GlyphGrouper, GlyphSpan, GlyphSpanner};
+use crate::text::logical::LogicalUnitPlan;
 use crate::text::type3::ColoredGlyph;
-use crate::text::{Font, FontContainer, FontIdentifier, PdfFont, PDF_UNITS_PER_EM};
+use crate::text::{Font, FontContainer, FontIdentifier, PdfFont, PdfLogicalUnit, PDF_UNITS_PER_EM};
 use crate::text::{Glyph, GlyphId};
 use crate::util::{calculate_stroke_bbox, NameExt};
 
@@ -521,6 +522,193 @@ impl ContentBuilder {
         }
 
         self.graphics_states.restore_state();
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn draw_pdf_logical_units<G: Glyph>(
+        &mut self,
+        start: Point,
+        sc: &mut SerializeContext,
+        chunk_container: &mut ChunkContainer,
+        fill: Option<&Fill>,
+        stroke: Option<&Stroke>,
+        units: &[PdfLogicalUnit<'_, G>],
+        font: Font,
+        font_size: f32,
+    ) {
+        if fill.is_none() && stroke.is_none() || units.is_empty() {
+            return;
+        }
+
+        let plans = units
+            .iter()
+            .map(|unit| unit.plan(&font))
+            .collect::<Vec<_>>();
+        let (x, y) = (start.x, start.y);
+        self.graphics_states.save_state();
+
+        let bbox_important = self.bbox_important;
+        let calculate_bbox = |is_solid: bool| bbox_important || !is_solid;
+        let fill_action = |sb: &mut ContentBuilder,
+                           sc: &mut SerializeContext,
+                           chunk_container: &mut ChunkContainer,
+                           fill: &Fill| {
+            let bbox = if calculate_bbox(matches!(&fill.paint.0, InnerPaint::Color(_))) {
+                let bbox = get_pdf_logical_units_bbox(&plans, x, y, font_size, font.clone());
+                sb.expand_bbox(bbox);
+                bbox
+            } else {
+                Rect::from_xywh(0.0, 0.0, 1.0, 1.0).unwrap()
+            };
+            sb.content_set_fill_properties(bbox, fill, sc, chunk_container)
+        };
+        let stroke_action = |sb: &mut ContentBuilder,
+                             sc: &mut SerializeContext,
+                             chunk_container: &mut ChunkContainer,
+                             stroke: &Stroke| {
+            let bbox = if calculate_bbox(matches!(&stroke.paint.0, InnerPaint::Color(_))) {
+                let bbox = get_pdf_logical_units_bbox(&plans, x, y, font_size, font.clone());
+                sb.expand_bbox(bbox);
+                bbox
+            } else {
+                Rect::from_xywh(0.0, 0.0, 1.0, 1.0).unwrap()
+            };
+            sb.content_set_stroke_properties(bbox, stroke, sc, chunk_container);
+        };
+
+        let set_fill_opacity = |sb: &mut ContentBuilder, fill: &Fill| {
+            if !matches!(&fill.paint.0, &InnerPaint::Pattern(_)) {
+                sb.set_fill_opacity(fill.opacity);
+            }
+        };
+        let set_stroke_opacity = |sb: &mut ContentBuilder, stroke: &Stroke| {
+            if !matches!(&stroke.paint.0, &InnerPaint::Pattern(_)) {
+                sb.set_stroke_opacity(stroke.opacity);
+                sb.set_fill_opacity(stroke.opacity);
+            }
+        };
+
+        match (fill, stroke) {
+            (Some(f), Some(s)) => {
+                set_fill_opacity(self, f);
+                set_stroke_opacity(self, s);
+                self.fill_stroke_pdf_logical_run(
+                    x,
+                    y,
+                    sc,
+                    chunk_container,
+                    TextRenderingMode::FillStroke,
+                    |sb, sc, chunk_container| {
+                        fill_action(sb, sc, chunk_container, f);
+                        stroke_action(sb, sc, chunk_container, s);
+                    },
+                    &plans,
+                    font.clone(),
+                    font_size,
+                );
+            }
+            (Some(f), None) => {
+                set_fill_opacity(self, f);
+                self.fill_stroke_pdf_logical_run(
+                    x,
+                    y,
+                    sc,
+                    chunk_container,
+                    TextRenderingMode::Fill,
+                    |sb, sc, chunk_container| fill_action(sb, sc, chunk_container, f),
+                    &plans,
+                    font.clone(),
+                    font_size,
+                );
+            }
+            (None, Some(s)) => {
+                set_stroke_opacity(self, s);
+                self.fill_stroke_pdf_logical_run(
+                    x,
+                    y,
+                    sc,
+                    chunk_container,
+                    TextRenderingMode::Stroke,
+                    |sb, sc, chunk_container| stroke_action(sb, sc, chunk_container, s),
+                    &plans,
+                    font.clone(),
+                    font_size,
+                );
+            }
+            (None, None) => unreachable!(),
+        }
+
+        self.graphics_states.restore_state();
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn fill_stroke_pdf_logical_run(
+        &mut self,
+        x: f32,
+        y: f32,
+        sc: &mut SerializeContext,
+        chunk_container: &mut ChunkContainer,
+        render_mode: TextRenderingMode,
+        action: impl FnOnce(&mut ContentBuilder, &mut SerializeContext, &mut ChunkContainer),
+        plans: &[LogicalUnitPlan],
+        font: Font,
+        font_size: f32,
+    ) {
+        if plans.is_empty() {
+            return;
+        }
+
+        self.apply_isolated_op(
+            |_, _, _| {},
+            |sb, sc, chunk_container| {
+                action(sb, sc, chunk_container);
+                sb.content.begin_text();
+                sb.content.set_text_rendering_mode(render_mode);
+
+                let font_container = sc.register_font_container(font.clone());
+                for plan in plans {
+                    if plan
+                        .key
+                        .components
+                        .iter()
+                        .any(|component| component.glyph_id == 0)
+                        || font.postscript_name() == Some("LastResort")
+                    {
+                        sc.register_validation_error(ValidationError::ContainsNotDefGlyph(
+                            font.clone(),
+                            plan.location,
+                            plan.key.text.clone(),
+                        ));
+                    }
+
+                    let (identifier, pdf_glyph, _) = font_container
+                        .borrow_mut()
+                        .add_logical_unit(plan.key.clone(), plan.location);
+                    let font_name = sb
+                        .rd_builder
+                        .register_resource(sc.register_font_identifier(identifier));
+                    sb.content.set_font(font_name.to_pdf_name(), font_size);
+                    sb.content.set_text_matrix(
+                        Transform::from_row(
+                            1.0,
+                            0.0,
+                            0.0,
+                            -1.0,
+                            x + plan.visual_x * font_size,
+                            y - plan.visual_y * font_size,
+                        )
+                        .to_pdf_transform(),
+                    );
+                    sb.scratch.clear();
+                    pdf_glyph.encode_into(&mut sb.scratch);
+                    sb.content.show(Str(&sb.scratch));
+                }
+
+                sb.content.end_text();
+            },
+            sc,
+            chunk_container,
+        );
     }
 
     /// Encode a successive sequence of glyphs that share the same properties and
@@ -1349,4 +1537,40 @@ fn get_glyphs_bbox(glyphs: &[impl Glyph], x: f32, y: f32, size: f32, font: Font)
     }
 
     Rect::from_ltrb(bl, bt, br, bb).unwrap()
+}
+
+fn get_pdf_logical_units_bbox(
+    plans: &[LogicalUnitPlan],
+    x: f32,
+    y: f32,
+    size: f32,
+    font: Font,
+) -> Rect {
+    let font_bbox = font.bbox();
+    let upem = font.units_per_em();
+    let mut bounds: Option<Rect> = None;
+
+    for plan in plans {
+        if plan.key.components.is_empty() {
+            continue;
+        }
+        for component in &plan.key.components {
+            let tx = x + plan.visual_x * size + component.x as f32 / upem * size;
+            let ty = y - plan.visual_y * size - component.y as f32 / upem * size;
+            let component_bounds = font_bbox
+                .transform(Transform::from_scale(size / upem, -size / upem))
+                .and_then(|bbox| bbox.transform(Transform::from_translate(tx, ty)));
+            if let Some(component_bounds) = component_bounds {
+                bounds = Some(match bounds {
+                    Some(mut current) => {
+                        current.expand(&component_bounds);
+                        current
+                    }
+                    None => component_bounds,
+                });
+            }
+        }
+    }
+
+    bounds.unwrap_or_else(|| Rect::from_xywh(x, y, 1.0, 1.0).unwrap())
 }

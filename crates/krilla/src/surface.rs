@@ -32,7 +32,7 @@ use crate::serialize::SerializeContext;
 use crate::stream::{Stream, StreamBuilder};
 use crate::tagging::ArtifactType;
 use crate::text::Font;
-use crate::text::{draw_glyph, Glyph};
+use crate::text::{draw_glyph, Glyph, PdfLogicalUnit};
 #[cfg(feature = "simple-text")]
 use crate::text::{shape::naive_shape, TextDirection};
 
@@ -267,6 +267,41 @@ impl<'a> Surface<'a> {
         }
     }
 
+    fn outline_pdf_logical_units<G: Glyph>(
+        &mut self,
+        units: &[PdfLogicalUnit<'_, G>],
+        context_color: rgb::Color,
+        start: Point,
+        font: Font,
+        font_size: f32,
+    ) {
+        for unit in units {
+            let mut pen_x = unit.visual_x;
+            let mut pen_y = unit.visual_y;
+
+            for glyph in unit.glyphs {
+                let mut base_transform = tiny_skia_path::Transform::from_translate(
+                    start.x + (pen_x + glyph.x_offset(1.0)) * font_size,
+                    start.y - (pen_y + glyph.y_offset(1.0)) * font_size,
+                );
+                base_transform = base_transform.pre_concat(tiny_skia_path::Transform::from_scale(
+                    font_size / font.units_per_em(),
+                    -font_size / font.units_per_em(),
+                ));
+                draw_glyph(
+                    font.clone(),
+                    context_color,
+                    glyph.glyph_id(),
+                    Transform::from_tsp(base_transform),
+                    self,
+                );
+
+                pen_x += glyph.x_advance(1.0);
+                pen_y += glyph.y_advance(1.0);
+            }
+        }
+    }
+
     /// Draw a sequence of glyphs using the currently active fill and/or stroke.
     ///
     /// This is a very low-level method, which gives you full control over how to place
@@ -363,6 +398,89 @@ impl<'a> Surface<'a> {
                     );
                 }
             }
+        }
+    }
+
+    /// Draw logical PDF text units using authoritative Unicode extraction semantics.
+    ///
+    /// This is an advanced low-level API for callers that already performed shaping,
+    /// bidirectional resolution, font fallback, and layout. Units must be supplied in
+    /// logical Unicode order, while each unit's `visual_x` and `visual_y` retain the
+    /// shaped visual placement. `PdfLogicalUnit::text` is treated as authoritative for
+    /// PDF text extraction and copy/paste.
+    ///
+    /// The initial implementation supports embedded static TrueType `glyf` fonts.
+    pub fn draw_pdf_logical_units<G: Glyph>(
+        &mut self,
+        start: Point,
+        units: &[PdfLogicalUnit<'_, G>],
+        font: Font,
+        font_size: f32,
+        outlined: bool,
+    ) {
+        let context_color = self.context_color();
+        if outlined {
+            self.outline_pdf_logical_units(units, context_color, start, font, font_size);
+            return;
+        }
+
+        match (self.fill.as_ref(), self.stroke.as_ref()) {
+            (Some(f), Some(s)) => {
+                if self.has_complex_fill_or_stroke() {
+                    self.bd.get_mut().draw_pdf_logical_units(
+                        start,
+                        self.sc,
+                        self.chunk_container,
+                        Some(f),
+                        None,
+                        units,
+                        font.clone(),
+                        font_size,
+                    );
+                    self.outline_pdf_logical_units(units, context_color, start, font, font_size);
+                } else {
+                    self.bd.get_mut().draw_pdf_logical_units(
+                        start,
+                        self.sc,
+                        self.chunk_container,
+                        Some(f),
+                        Some(s),
+                        units,
+                        font,
+                        font_size,
+                    );
+                }
+            }
+            (None, Some(s)) => self.bd.get_mut().draw_pdf_logical_units(
+                start,
+                self.sc,
+                self.chunk_container,
+                None,
+                Some(s),
+                units,
+                font,
+                font_size,
+            ),
+            (Some(f), None) => self.bd.get_mut().draw_pdf_logical_units(
+                start,
+                self.sc,
+                self.chunk_container,
+                Some(f),
+                None,
+                units,
+                font,
+                font_size,
+            ),
+            (None, None) => self.bd.get_mut().draw_pdf_logical_units(
+                start,
+                self.sc,
+                self.chunk_container,
+                Some(&Fill::default()),
+                None,
+                units,
+                font,
+                font_size,
+            ),
         }
     }
 

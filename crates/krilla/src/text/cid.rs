@@ -20,7 +20,9 @@ use crate::geom::Rect;
 use crate::serialize::SerializeContext;
 use crate::stream::FilterStreamBuilder;
 use crate::surface::Location;
+use crate::text::logical::LogicalUnitKey;
 use crate::text::outline::OutlineBuilder;
+use crate::text::truetype_logical::{synthesize_logical_glyphs, SyntheticLogicalGlyph};
 use crate::text::Font;
 use crate::text::GlyphId;
 use crate::util::{stable_hash128, SliceExt};
@@ -113,6 +115,10 @@ pub(crate) struct CIDFont {
     cmap_entries: FxHashMap<u16, (String, Option<Location>)>,
     /// The widths of the glyphs, _indexed by their CID_.
     widths: Vec<f32>,
+    /// Synthetic TrueType glyphs used by authoritative logical PDF text units.
+    logical_glyphs: FxHashMap<LogicalUnitKey, (Cid, u16)>,
+    /// Synthetic glyph definitions in virtual-GID allocation order.
+    synthetic_logical_glyphs: Vec<SyntheticLogicalGlyph>,
     is_empty: bool,
 }
 
@@ -127,6 +133,8 @@ impl CIDFont {
             glyph_remapper: GlyphRemapper::new(),
             cmap_entries: FxHashMap::default(),
             widths,
+            logical_glyphs: FxHashMap::default(),
+            synthetic_logical_glyphs: Vec::new(),
             font,
             is_empty: true,
         }
@@ -169,6 +177,37 @@ impl CIDFont {
         new_id
     }
 
+    /// Add one authoritative logical PDF unit and return its CID plus virtual source GID.
+    pub(crate) fn add_logical_unit(
+        &mut self,
+        key: LogicalUnitKey,
+        location: Option<Location>,
+    ) -> (Cid, GlyphId) {
+        if let Some((cid, gid)) = self.logical_glyphs.get(&key).copied() {
+            return (cid, GlyphId::new(u32::from(gid)));
+        }
+
+        self.is_empty = false;
+        let base = self.font.num_glyphs();
+        let index = u32::try_from(self.synthetic_logical_glyphs.len())
+            .expect("logical glyph count exceeds u32");
+        let virtual_gid = base
+            .checked_add(index)
+            .and_then(|gid| u16::try_from(gid).ok())
+            .expect("logical PDF units exceed the TrueType glyph limit");
+        let cid = self.glyph_remapper.remap(virtual_gid);
+
+        if cid as usize >= self.widths.len() {
+            self.widths.push(key.advance_width as f32);
+        }
+        self.cmap_entries.insert(cid, (key.text.clone(), location));
+        self.logical_glyphs.insert(key.clone(), (cid, virtual_gid));
+        self.synthetic_logical_glyphs
+            .push(SyntheticLogicalGlyph { virtual_gid, key });
+
+        (cid, GlyphId::new(u32::from(virtual_gid)))
+    }
+
     #[inline]
     pub(crate) fn get_codepoints(&self, cid: Cid) -> Option<&str> {
         self.cmap_entries.get(&cid).map(|s| s.0.as_str())
@@ -200,10 +239,15 @@ impl CIDFont {
         let data_ref = sc.new_ref();
 
         let glyph_remapper = &self.glyph_remapper;
+        let embedding_font = if self.synthetic_logical_glyphs.is_empty() {
+            self.font.clone()
+        } else {
+            synthesize_logical_glyphs(&self.font, &self.synthetic_logical_glyphs)?
+        };
 
-        let is_glyf = self.font.font_ref().glyf().is_ok();
-        let is_cff = self.font.font_ref().cff().is_ok();
-        let is_cff2 = self.font.font_ref().cff2().is_ok();
+        let is_glyf = embedding_font.font_ref().glyf().is_ok();
+        let is_cff = embedding_font.font_ref().cff().is_ok();
+        let is_cff2 = embedding_font.font_ref().cff2().is_ok();
 
         if !is_glyf && !is_cff && !is_cff2 {
             return Err(KrillaError::Font(
@@ -234,7 +278,7 @@ impl CIDFont {
             sc.register_validation_error(ValidationError::RestrictedLicense(self.font.clone()));
         }
 
-        let (subsetted, global_bbox) = subset_font(self.font.clone(), glyph_remapper)?;
+        let (subsetted, global_bbox) = subset_font(embedding_font, glyph_remapper)?;
         let num_glyphs = subsetted.num_glyphs();
         let subsetted_data = subsetted.font_data().0;
 

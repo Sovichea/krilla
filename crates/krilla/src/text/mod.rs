@@ -17,17 +17,21 @@ use std::hash::Hash;
 use rustc_hash::FxHashMap;
 
 use crate::text::cid::CIDFont;
+use crate::text::logical::LogicalUnitKey;
 use crate::text::type3::{ColoredGlyph, Type3Font, Type3FontMapper, Type3ID};
 pub(crate) mod cid;
 pub(crate) mod font;
 pub(crate) mod glyph;
 pub(crate) mod group;
+pub(crate) mod logical;
 #[cfg(feature = "simple-text")]
 pub(crate) mod shape;
+pub(crate) mod truetype_logical;
 pub(crate) mod type3;
 
 pub use font::*;
 pub use glyph::*;
+pub use logical::PdfLogicalUnit;
 #[cfg(feature = "simple-text")]
 pub use shape::TextDirection;
 
@@ -136,6 +140,15 @@ impl FontContainer {
             self.type3_cache.insert(glyph.to_owned(), res.clone());
             res
         }
+    }
+
+    pub(crate) fn add_logical_unit(
+        &mut self,
+        key: LogicalUnitKey,
+        location: Option<crate::surface::Location>,
+    ) -> (FontIdentifier, PDFGlyph, GlyphId) {
+        let (cid, virtual_gid) = self.cid_font.add_logical_unit(key, location);
+        (self.cid_font.identifier(), PDFGlyph::Cid(cid), virtual_gid)
     }
 }
 
