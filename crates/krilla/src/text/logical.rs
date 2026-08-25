@@ -51,26 +51,33 @@ pub(crate) struct LogicalComponent {
     pub(crate) y: i32,
 }
 
-/// Identity of one reusable logical PDF character.
-///
-/// Unicode is intentionally part of the key. Two uses of the same source glyph can therefore
-/// receive different PDF CIDs when they carry different extraction semantics. Conversely, a
-/// multi-glyph shaped cluster is represented by one key and ultimately one CID.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
-pub(crate) struct LogicalUnitKey {
-    pub(crate) text: String,
+pub(crate) struct VisualUnitKey {
     pub(crate) advance_width: i32,
     pub(crate) components: Vec<LogicalComponent>,
 }
 
 #[derive(Clone, Debug)]
 pub(crate) struct LogicalUnitPlan {
-    pub(crate) key: LogicalUnitKey,
+    pub(crate) text: String,
+    pub(crate) visual: VisualUnitKey,
     /// Absolute visual origin of the synthetic glyph, normalized to font size 1.
     pub(crate) visual_x: f32,
     /// Baseline displacement of the unit, normalized to font size 1.
     pub(crate) visual_y: f32,
     pub(crate) location: Option<Location>,
+}
+
+impl LogicalUnitPlan {
+    pub(crate) fn is_visually_contiguous_with(&self, next: &Self, upem: f32) -> bool {
+        let expected_x = self.visual_x + self.visual.advance_width as f32 / upem;
+        nearly_equal(expected_x, next.visual_x) && nearly_equal(self.visual_y, next.visual_y)
+    }
+}
+
+fn nearly_equal(left: f32, right: f32) -> bool {
+    let scale = left.abs().max(right.abs()).max(1.0);
+    (left - right).abs() <= 8.0 * f32::EPSILON * scale
 }
 
 impl<'a, G: Glyph> PdfLogicalUnit<'a, G> {
@@ -108,8 +115,8 @@ impl<'a, G: Glyph> PdfLogicalUnit<'a, G> {
             .collect();
 
         LogicalUnitPlan {
-            key: LogicalUnitKey {
-                text: self.text.to_owned(),
+            text: self.text.to_owned(),
+            visual: VisualUnitKey {
                 advance_width: ((max_x - min_x) * upem).round() as i32,
                 components,
             },
@@ -117,5 +124,36 @@ impl<'a, G: Glyph> PdfLogicalUnit<'a, G> {
             visual_y: self.visual_y,
             location: self.location,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{LogicalUnitPlan, VisualUnitKey};
+
+    fn plan(x: f32, y: f32, advance_width: i32) -> LogicalUnitPlan {
+        LogicalUnitPlan {
+            text: String::new(),
+            visual: VisualUnitKey {
+                advance_width,
+                components: Vec::new(),
+            },
+            visual_x: x,
+            visual_y: y,
+            location: None,
+        }
+    }
+
+    #[test]
+    fn detects_exact_horizontal_continuity() {
+        assert!(plan(1.0, 2.0, 600).is_visually_contiguous_with(&plan(1.6, 2.0, 300), 1000.0));
+    }
+
+    #[test]
+    fn rejects_gaps_vertical_changes_and_rtl_reordering() {
+        let current = plan(1.0, 2.0, 600);
+        assert!(!current.is_visually_contiguous_with(&plan(1.61, 2.0, 300), 1000.0));
+        assert!(!current.is_visually_contiguous_with(&plan(1.6, 2.1, 300), 1000.0));
+        assert!(!current.is_visually_contiguous_with(&plan(0.4, 2.0, 300), 1000.0));
     }
 }

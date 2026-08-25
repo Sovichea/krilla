@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::error::{KrillaError, KrillaResult};
-use crate::text::logical::LogicalUnitKey;
+use crate::text::logical::VisualUnitKey;
 use crate::text::Font;
 
 const HEAD: [u8; 4] = *b"head";
@@ -25,7 +25,7 @@ const HAVE_2X2: u16 = 0x0080;
 #[derive(Clone, Debug)]
 pub(crate) struct SyntheticLogicalGlyph {
     pub(crate) virtual_gid: u16,
-    pub(crate) key: LogicalUnitKey,
+    pub(crate) visual: VisualUnitKey,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -145,7 +145,7 @@ pub(crate) fn synthesize_logical_glyphs(
 
     for logical in logical_glyphs {
         let (bytes, bbox, stats) = build_composite(
-            &logical.key,
+            &logical.visual,
             base_glyph_count,
             source_glyf,
             &new_loca[..=usize::from(base_glyph_count)],
@@ -159,14 +159,14 @@ pub(crate) fn synthesize_logical_glyphs(
         new_loca
             .push(u32::try_from(glyf.len()).map_err(|_| font_error(font, "glyf table too large"))?);
 
-        let advance = u16::try_from(logical.key.advance_width)
+        let advance = u16::try_from(logical.visual.advance_width)
             .map_err(|_| font_error(font, "logical unit advance does not fit TrueType hmtx"))?;
         metrics.push((advance, bbox.x_min));
         synthetic_bbox = Some(synthetic_bbox.map_or(bbox, |current| current.union(bbox)));
         max_points = max_points.max(stats.points);
         max_contours = max_contours.max(stats.contours);
         max_components =
-            max_components.max(u16::try_from(logical.key.components.len()).unwrap_or(u16::MAX));
+            max_components.max(u16::try_from(logical.visual.components.len()).unwrap_or(u16::MAX));
         max_depth = max_depth.max(stats.depth);
     }
 
@@ -235,7 +235,7 @@ pub(crate) fn synthesize_logical_glyphs(
 }
 
 fn build_composite(
-    key: &LogicalUnitKey,
+    key: &VisualUnitKey,
     base_glyph_count: u16,
     glyf: &[u8],
     loca: &[u32],

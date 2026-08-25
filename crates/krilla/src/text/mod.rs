@@ -17,13 +17,15 @@ use std::hash::Hash;
 use rustc_hash::FxHashMap;
 
 use crate::text::cid::CIDFont;
-use crate::text::logical::LogicalUnitKey;
+use crate::text::logical::VisualUnitKey;
+use crate::text::logical_font::{LogicalFontMapper, LogicalPdfGlyph};
 use crate::text::type3::{ColoredGlyph, Type3Font, Type3FontMapper, Type3ID};
 pub(crate) mod cid;
 pub(crate) mod font;
 pub(crate) mod glyph;
 pub(crate) mod group;
 pub(crate) mod logical;
+pub(crate) mod logical_font;
 #[cfg(feature = "simple-text")]
 pub(crate) mod shape;
 pub(crate) mod truetype_logical;
@@ -48,11 +50,15 @@ pub(crate) struct CIDIdentifier(pub Font);
 #[derive(Clone, Debug, Hash, Eq, PartialEq)]
 pub(crate) struct Type3Identifier(pub Font, pub Type3ID);
 
+#[derive(Clone, Debug, Hash, Eq, PartialEq)]
+pub(crate) struct LogicalFontIdentifier(pub Font, pub usize);
+
 /// A font identifier for a PDF font.
 #[derive(Clone, Debug, Hash, Eq, PartialEq)]
 pub(crate) enum FontIdentifier {
     Cid(CIDIdentifier),
     Type3(Type3Identifier),
+    Logical(LogicalFontIdentifier),
 }
 
 /// A container that holds all PDF fonts belonging to an OTF font.
@@ -60,6 +66,7 @@ pub(crate) struct FontContainer {
     font: Font,
     type3_mapper: Type3FontMapper,
     cid_font: CIDFont,
+    logical_mapper: LogicalFontMapper,
     cid_cache: FxHashMap<u32, (FontIdentifier, PDFGlyph)>,
     type3_cache: HashMap<ColoredGlyph, (FontIdentifier, PDFGlyph)>,
 }
@@ -70,6 +77,7 @@ impl FontContainer {
             font: font.clone(),
             type3_mapper: Type3FontMapper::new(font.clone()),
             cid_font: CIDFont::new(font.clone()),
+            logical_mapper: LogicalFontMapper::new(font.clone()),
             cid_cache: Default::default(),
             type3_cache: Default::default(),
         }
@@ -81,6 +89,10 @@ impl FontContainer {
 
     pub(crate) fn cid_font(&self) -> &CIDFont {
         &self.cid_font
+    }
+
+    pub(crate) fn logical_mapper(&self) -> &LogicalFontMapper {
+        &self.logical_mapper
     }
 
     #[inline]
@@ -144,11 +156,11 @@ impl FontContainer {
 
     pub(crate) fn add_logical_unit(
         &mut self,
-        key: LogicalUnitKey,
+        text: String,
+        visual: VisualUnitKey,
         location: Option<crate::surface::Location>,
-    ) -> (FontIdentifier, PDFGlyph, GlyphId) {
-        let (cid, virtual_gid) = self.cid_font.add_logical_unit(key, location);
-        (self.cid_font.identifier(), PDFGlyph::Cid(cid), virtual_gid)
+    ) -> LogicalPdfGlyph {
+        self.logical_mapper.add(text, visual, location)
     }
 }
 

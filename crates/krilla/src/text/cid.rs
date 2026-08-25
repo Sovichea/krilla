@@ -20,7 +20,7 @@ use crate::geom::Rect;
 use crate::serialize::SerializeContext;
 use crate::stream::FilterStreamBuilder;
 use crate::surface::Location;
-use crate::text::logical::LogicalUnitKey;
+use crate::text::logical::VisualUnitKey;
 use crate::text::outline::OutlineBuilder;
 use crate::text::truetype_logical::{synthesize_logical_glyphs, SyntheticLogicalGlyph};
 use crate::text::Font;
@@ -115,16 +115,24 @@ pub(crate) struct CIDFont {
     cmap_entries: FxHashMap<u16, (String, Option<Location>)>,
     /// The widths of the glyphs, _indexed by their CID_.
     widths: Vec<f32>,
-    /// Synthetic TrueType glyphs used by authoritative logical PDF text units.
-    logical_glyphs: FxHashMap<LogicalUnitKey, (Cid, u16)>,
     /// Synthetic glyph definitions in virtual-GID allocation order.
     synthetic_logical_glyphs: Vec<SyntheticLogicalGlyph>,
+    /// Distinguishes independent logical font shards with otherwise identical subsets.
+    subset_salt: Option<usize>,
     is_empty: bool,
 }
 
 impl CIDFont {
     /// Create a new CID-keyed font.
     pub(crate) fn new(font: Font) -> CIDFont {
+        Self::new_with_salt(font, None)
+    }
+
+    pub(crate) fn new_logical(font: Font, shard: usize) -> CIDFont {
+        Self::new_with_salt(font, Some(shard))
+    }
+
+    fn new_with_salt(font: Font, subset_salt: Option<usize>) -> CIDFont {
         // Always include the .notdef glyph. Will also always be included by the subsetter in
         // the glyph remapper.
         let widths = vec![font.advance_width(GlyphId::new(0)).unwrap_or(0.0)];
@@ -133,8 +141,8 @@ impl CIDFont {
             glyph_remapper: GlyphRemapper::new(),
             cmap_entries: FxHashMap::default(),
             widths,
-            logical_glyphs: FxHashMap::default(),
             synthetic_logical_glyphs: Vec::new(),
+            subset_salt,
             font,
             is_empty: true,
         }
@@ -177,16 +185,17 @@ impl CIDFont {
         new_id
     }
 
-    /// Add one authoritative logical PDF unit and return its CID plus virtual source GID.
-    pub(crate) fn add_logical_unit(
-        &mut self,
-        key: LogicalUnitKey,
-        location: Option<Location>,
-    ) -> (Cid, GlyphId) {
-        if let Some((cid, gid)) = self.logical_glyphs.get(&key).copied() {
-            return (cid, GlyphId::new(u32::from(gid)));
-        }
+    pub(crate) fn remaining_logical_glyph_capacity(&self) -> usize {
+        (usize::from(u16::MAX) + 1)
+            .saturating_sub(self.font.num_glyphs() as usize)
+            .saturating_sub(self.synthetic_logical_glyphs.len())
+    }
 
+    /// Add one synthetic visual unit and return its CID.
+    pub(crate) fn add_logical_visual(&mut self, visual: VisualUnitKey) -> Option<Cid> {
+        if self.remaining_logical_glyph_capacity() == 0 {
+            return None;
+        }
         self.is_empty = false;
         let base = self.font.num_glyphs();
         let index = u32::try_from(self.synthetic_logical_glyphs.len())
@@ -194,18 +203,18 @@ impl CIDFont {
         let virtual_gid = base
             .checked_add(index)
             .and_then(|gid| u16::try_from(gid).ok())
-            .expect("logical PDF units exceed the TrueType glyph limit");
+            .expect("logical glyph capacity was checked before allocation");
         let cid = self.glyph_remapper.remap(virtual_gid);
 
         if cid as usize >= self.widths.len() {
-            self.widths.push(key.advance_width as f32);
+            self.widths.push(visual.advance_width as f32);
         }
-        self.cmap_entries.insert(cid, (key.text.clone(), location));
-        self.logical_glyphs.insert(key.clone(), (cid, virtual_gid));
-        self.synthetic_logical_glyphs
-            .push(SyntheticLogicalGlyph { virtual_gid, key });
+        self.synthetic_logical_glyphs.push(SyntheticLogicalGlyph {
+            virtual_gid,
+            visual,
+        });
 
-        (cid, GlyphId::new(u32::from(virtual_gid)))
+        Some(cid)
     }
 
     #[inline]
@@ -297,7 +306,11 @@ impl CIDFont {
             FilterStreamBuilder::new_from_binary_data(data).finish(&sc.serialize_settings())
         };
 
-        let base_font = base_font_name(&self.font, &self.glyph_remapper);
+        let base_font = if let Some(salt) = self.subset_salt {
+            base_font_name(&self.font, &(&self.glyph_remapper, salt))
+        } else {
+            base_font_name(&self.font, &self.glyph_remapper)
+        };
         let base_font_type0 = if is_cff {
             format!("{base_font}-{IDENTITY_H}")
         } else {

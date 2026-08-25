@@ -666,9 +666,10 @@ impl ContentBuilder {
                 sb.content.set_text_rendering_mode(render_mode);
 
                 let font_container = sc.register_font_container(font.clone());
+                let mut mapped = Vec::with_capacity(plans.len());
                 for plan in plans {
                     if plan
-                        .key
+                        .visual
                         .components
                         .iter()
                         .any(|component| component.glyph_id == 0)
@@ -677,16 +678,35 @@ impl ContentBuilder {
                         sc.register_validation_error(ValidationError::ContainsNotDefGlyph(
                             font.clone(),
                             plan.location,
-                            plan.key.text.clone(),
+                            plan.text.clone(),
                         ));
                     }
 
-                    let (identifier, pdf_glyph, _) = font_container
-                        .borrow_mut()
-                        .add_logical_unit(plan.key.clone(), plan.location);
-                    let font_name = sb
-                        .rd_builder
-                        .register_resource(sc.register_font_identifier(identifier));
+                    let pdf_glyph = font_container.borrow_mut().add_logical_unit(
+                        plan.text.clone(),
+                        plan.visual.clone(),
+                        plan.location,
+                    );
+                    mapped.push((plan, pdf_glyph));
+                }
+
+                let upem = font.units_per_em();
+                let mut start = 0;
+                while start < mapped.len() {
+                    let mut end = start + 1;
+                    while end < mapped.len()
+                        && mapped[end - 1].1.identifier == mapped[end].1.identifier
+                        && mapped[end - 1]
+                            .0
+                            .is_visually_contiguous_with(mapped[end].0, upem)
+                    {
+                        end += 1;
+                    }
+
+                    let (plan, first_glyph) = &mapped[start];
+                    let font_name = sb.rd_builder.register_resource(
+                        sc.register_font_identifier(first_glyph.identifier.clone()),
+                    );
                     sb.content.set_font(font_name.to_pdf_name(), font_size);
                     sb.content.set_text_matrix(
                         Transform::from_row(
@@ -700,8 +720,11 @@ impl ContentBuilder {
                         .to_pdf_transform(),
                     );
                     sb.scratch.clear();
-                    pdf_glyph.encode_into(&mut sb.scratch);
+                    for (_, glyph) in &mapped[start..end] {
+                        glyph.encode_into(&mut sb.scratch);
+                    }
                     sb.content.show(Str(&sb.scratch));
+                    start = end;
                 }
 
                 sb.content.end_text();
@@ -1551,10 +1574,10 @@ fn get_pdf_logical_units_bbox(
     let mut bounds: Option<Rect> = None;
 
     for plan in plans {
-        if plan.key.components.is_empty() {
+        if plan.visual.components.is_empty() {
             continue;
         }
-        for component in &plan.key.components {
+        for component in &plan.visual.components {
             let tx = x + plan.visual_x * size + component.x as f32 / upem * size;
             let ty = y - plan.visual_y * size - component.y as f32 / upem * size;
             let component_bounds = font_bbox
