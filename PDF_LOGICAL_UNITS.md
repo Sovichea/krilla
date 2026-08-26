@@ -100,6 +100,37 @@ without changing shaped placement or assuming a writing system.
 
 The ordinary `draw_glyphs` path is unchanged.
 
+## Version 3
+
+Version 3 keeps version 2's logical-unit, semantic-CID, and font-sharding model unchanged. It
+optimizes only how already-planned logical units are written into page content streams.
+
+```text
+Version 2:  Tf Tm Tj   Tf Tm Tj   Tf Tm Tj
+Version 3:  Tf Tm [text adjustment text adjustment text] TJ
+```
+
+Within one PDF text object, Krilla now retains the selected logical-font shard and emits `Tf`
+only when the shard changes. Units on a compatible baseline and shard are collected into one
+positioned `TJ` array. The array keeps character codes in authoritative logical order and uses
+numeric adjustments to reproduce their independently shaped visual positions. This supports
+ordinary left-to-right spacing and backward visual movement in right-to-left runs without
+reordering the semantic text.
+
+Batching stops at a shard transition, baseline change, invalid coordinate, or other placement
+that cannot be expressed safely as a horizontal `TJ` adjustment. Tag and marked-content
+boundaries remain outside this operation and are therefore not crossed.
+
+Positioning adjustments are rounded to two decimal places in PDF text space. One text-space
+unit is one thousandth of the font size, so the maximum rounding error per adjustment is
+0.000005 em. This removes unstable floating-point tails, improves stream compression, and stays
+far below display-pixel precision.
+
+Version 3 therefore differs from version 2 in serialization efficiency, not in Unicode
+identity, synthetic glyph construction, font capacity, tagging, or the public
+`PdfLogicalUnit` API. It remains the universal logical path for supported fonts; no
+script-specific or hybrid routing is required.
+
 ## Why version 2 does not use 32-bit character codes
 
 A prototype separated a four-byte PDF source code from the visual CID through a custom Encoding
@@ -132,6 +163,13 @@ The version 2 implementation is covered by unit tests for:
 - sharding at the actual TrueType glyph limit;
 - conservative batching of contiguous horizontal units;
 - rejection of batching across gaps, vertical changes, and RTL/reordered positions.
+
+Version 3 additionally tests:
+
+- forward and backward (`RTL`) `TJ` adjustment signs;
+- rejection across incompatible baselines and invalid coordinates;
+- stable two-decimal PDF positioning values; and
+- benchmark coverage of font-state reuse and shard transitions.
 
 The real Typst Khmer document is additionally checked for:
 
