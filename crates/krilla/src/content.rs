@@ -691,6 +691,7 @@ impl ContentBuilder {
                 }
 
                 let upem = font.units_per_em();
+                let mut active_font = None;
                 let mut start = 0;
                 while start < mapped.len() {
                     let mut end = start + 1;
@@ -698,16 +699,20 @@ impl ContentBuilder {
                         && mapped[end - 1].1.identifier == mapped[end].1.identifier
                         && mapped[end - 1]
                             .0
-                            .is_visually_contiguous_with(mapped[end].0, upem)
+                            .tj_adjustment_to(mapped[end].0, upem)
+                            .is_some()
                     {
                         end += 1;
                     }
 
                     let (plan, first_glyph) = &mapped[start];
-                    let font_name = sb.rd_builder.register_resource(
-                        sc.register_font_identifier(first_glyph.identifier.clone()),
-                    );
-                    sb.content.set_font(font_name.to_pdf_name(), font_size);
+                    if active_font.as_ref() != Some(&first_glyph.identifier) {
+                        let font_name = sb.rd_builder.register_resource(
+                            sc.register_font_identifier(first_glyph.identifier.clone()),
+                        );
+                        sb.content.set_font(font_name.to_pdf_name(), font_size);
+                        active_font = Some(first_glyph.identifier.clone());
+                    }
                     sb.content.set_text_matrix(
                         Transform::from_row(
                             1.0,
@@ -719,11 +724,45 @@ impl ContentBuilder {
                         )
                         .to_pdf_transform(),
                     );
-                    sb.scratch.clear();
-                    for (_, glyph) in &mapped[start..end] {
-                        glyph.encode_into(&mut sb.scratch);
+
+                    let has_adjustments = mapped[start..end].windows(2).any(|pair| {
+                        let adjustment = pair[0]
+                            .0
+                            .tj_adjustment_to(pair[1].0, upem)
+                            .expect("logical group must have compatible positioning");
+                        !approx_eq!(f32, adjustment, 0.0, epsilon = 0.001)
+                    });
+
+                    if has_adjustments {
+                        sb.scratch.clear();
+                        let mut positioned = sb.content.show_positioned();
+                        let mut items = positioned.items();
+                        for index in start..end {
+                            mapped[index].1.encode_into(&mut sb.scratch);
+                            if index + 1 < end {
+                                let adjustment = mapped[index]
+                                    .0
+                                    .tj_adjustment_to(mapped[index + 1].0, upem)
+                                    .expect("logical group must have compatible positioning");
+                                if !approx_eq!(f32, adjustment, 0.0, epsilon = 0.001) {
+                                    items.show(Str(&sb.scratch));
+                                    sb.scratch.clear();
+                                    items.adjust(adjustment);
+                                }
+                            }
+                        }
+                        if !sb.scratch.is_empty() {
+                            items.show(Str(&sb.scratch));
+                        }
+                        items.finish();
+                        positioned.finish();
+                    } else {
+                        sb.scratch.clear();
+                        for (_, glyph) in &mapped[start..end] {
+                            glyph.encode_into(&mut sb.scratch);
+                        }
+                        sb.content.show(Str(&sb.scratch));
                     }
-                    sb.content.show(Str(&sb.scratch));
                     start = end;
                 }
 

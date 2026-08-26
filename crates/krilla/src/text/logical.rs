@@ -69,9 +69,39 @@ pub(crate) struct LogicalUnitPlan {
 }
 
 impl LogicalUnitPlan {
+    /// Precision used for positioning values in PDF text space.
+    ///
+    /// One unit is one thousandth of the font size, so two decimal places are
+    /// substantially below device-pixel precision while avoiding noisy decimal
+    /// tails from shaped `f32` coordinates.
+    const TJ_PRECISION: f32 = 100.0;
+
+    #[cfg(test)]
     pub(crate) fn is_visually_contiguous_with(&self, next: &Self, upem: f32) -> bool {
+        self.tj_adjustment_to(next, upem)
+            .is_some_and(|adjustment| nearly_equal(adjustment, 0.0))
+    }
+
+    /// Return the `TJ` adjustment that places `next` at its shaped visual position.
+    ///
+    /// PDF subtracts `TJ` adjustments from the current horizontal text position. The
+    /// adjustment is therefore negative for a forward LTR gap and positive when logical-order
+    /// text moves backwards visually, as in an RTL run.
+    pub(crate) fn tj_adjustment_to(&self, next: &Self, upem: f32) -> Option<f32> {
+        if !nearly_equal(self.visual_y, next.visual_y) || !upem.is_finite() || upem <= 0.0 {
+            return None;
+        }
+
         let expected_x = self.visual_x + self.visual.advance_width as f32 / upem;
-        nearly_equal(expected_x, next.visual_x) && nearly_equal(self.visual_y, next.visual_y)
+        let displacement = next.visual_x - expected_x;
+        let exact_adjustment = -displacement * crate::text::PDF_UNITS_PER_EM;
+        let adjustment = (exact_adjustment * Self::TJ_PRECISION).round() / Self::TJ_PRECISION;
+        let reconstructed = -adjustment / crate::text::PDF_UNITS_PER_EM;
+
+        let quantization_error = 0.5 / Self::TJ_PRECISION / crate::text::PDF_UNITS_PER_EM;
+        (adjustment.is_finite()
+            && (displacement - reconstructed).abs() <= quantization_error + f32::EPSILON)
+            .then_some(adjustment)
     }
 }
 
@@ -155,5 +185,43 @@ mod tests {
         assert!(!current.is_visually_contiguous_with(&plan(1.61, 2.0, 300), 1000.0));
         assert!(!current.is_visually_contiguous_with(&plan(1.6, 2.1, 300), 1000.0));
         assert!(!current.is_visually_contiguous_with(&plan(0.4, 2.0, 300), 1000.0));
+    }
+
+    #[test]
+    fn encodes_forward_and_rtl_displacements_without_reordering() {
+        let current = plan(1.0, 2.0, 600);
+        let forward = current
+            .tj_adjustment_to(&plan(1.7, 2.0, 300), 1000.0)
+            .unwrap();
+        let rtl = current
+            .tj_adjustment_to(&plan(0.4, 2.0, 300), 1000.0)
+            .unwrap();
+
+        assert!((forward + 100.0).abs() < 0.001);
+        assert!((rtl - 1200.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn quantizes_tj_adjustments_to_stable_pdf_numbers() {
+        let current = plan(0.0, 0.0, 253);
+        let adjustment = current
+            .tj_adjustment_to(&plan(-0.570_997_8, 0.0, 300), 1000.0)
+            .unwrap();
+
+        assert_eq!(adjustment, 824.0);
+    }
+
+    #[test]
+    fn rejects_tj_positioning_across_baselines_or_invalid_coordinates() {
+        let current = plan(1.0, 2.0, 600);
+        assert!(current
+            .tj_adjustment_to(&plan(1.6, 2.1, 300), 1000.0)
+            .is_none());
+        assert!(current
+            .tj_adjustment_to(&plan(f32::INFINITY, 2.0, 300), 1000.0)
+            .is_none());
+        assert!(current
+            .tj_adjustment_to(&plan(1.6, 2.0, 300), 0.0)
+            .is_none());
     }
 }
