@@ -789,9 +789,7 @@ impl SerializeContext {
 
             for logical_font in borrowed.logical_mapper().fonts() {
                 let f = self.register_font_identifier(logical_font.identifier());
-                logical_font
-                    .cid_font()
-                    .serialize(self, chunk_container, f.get_ref())?;
+                logical_font.serialize(self, chunk_container, f.get_ref())?;
             }
         }
 

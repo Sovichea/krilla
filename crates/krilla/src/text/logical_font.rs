@@ -1,8 +1,12 @@
 use rustc_hash::FxHashMap;
 
+use crate::chunk_container::ChunkContainer;
+use crate::error::KrillaResult;
+use crate::serialize::SerializeContext;
 use crate::surface::Location;
-use crate::text::cid::CIDFont;
+use crate::text::cid::{serialize_logical_font, Cid};
 use crate::text::logical::VisualUnitKey;
+use crate::text::truetype_logical::{CompactGlyphAddition, CompactGlyphTracker};
 use crate::text::{Font, FontIdentifier, LogicalFontIdentifier, PDFGlyph};
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -23,18 +27,35 @@ impl LogicalPdfGlyph {
     }
 }
 
+pub(crate) struct LogicalSemanticRecord {
+    pub(crate) text: String,
+    pub(crate) location: Option<Location>,
+    pub(crate) visual: usize,
+}
+
 pub(crate) struct LogicalCIDFont {
+    font: Font,
     identifier: FontIdentifier,
-    cid_font: CIDFont,
-    logical_count: usize,
+    visuals: Vec<VisualUnitKey>,
+    visual_map: FxHashMap<VisualUnitKey, usize>,
+    semantics: Vec<LogicalSemanticRecord>,
+    compact_glyphs: CompactGlyphTracker,
+}
+
+enum VisualAddition {
+    Existing,
+    New(CompactGlyphAddition),
 }
 
 impl LogicalCIDFont {
     fn new(font: Font, index: usize) -> Self {
         Self {
             identifier: FontIdentifier::Logical(LogicalFontIdentifier(font.clone(), index)),
-            cid_font: CIDFont::new_logical(font, index),
-            logical_count: 0,
+            font,
+            visuals: Vec::new(),
+            visual_map: FxHashMap::default(),
+            semantics: Vec::new(),
+            compact_glyphs: CompactGlyphTracker::new(),
         }
     }
 
@@ -42,12 +63,26 @@ impl LogicalCIDFont {
         self.identifier.clone()
     }
 
-    pub(crate) fn cid_font(&self) -> &CIDFont {
-        &self.cid_font
-    }
+    fn plan_addition(
+        &self,
+        visual: &VisualUnitKey,
+        semantic_limit: usize,
+        embedded_glyph_limit: usize,
+    ) -> Option<VisualAddition> {
+        if self.semantics.len() >= semantic_limit || self.semantics.len() >= usize::from(u16::MAX) {
+            return None;
+        }
+        if self.visual_map.contains_key(visual) {
+            return Some(VisualAddition::Existing);
+        }
 
-    fn has_capacity(&self, limit: usize) -> bool {
-        self.logical_count < limit && self.cid_font.remaining_logical_glyph_capacity() > 0
+        let addition = self
+            .compact_glyphs
+            .plan(&self.font, visual)
+            .expect("logical visual was validated before allocation");
+        self.compact_glyphs
+            .can_commit(&addition, embedded_glyph_limit)
+            .then_some(VisualAddition::New(addition))
     }
 
     fn add(
@@ -55,11 +90,66 @@ impl LogicalCIDFont {
         text: String,
         visual: VisualUnitKey,
         location: Option<Location>,
-    ) -> Option<PDFGlyph> {
-        let cid = self.cid_font.add_logical_visual(visual)?;
-        self.cid_font.set_codepoints(cid, text, location);
-        self.logical_count += 1;
-        Some(PDFGlyph::Cid(cid))
+        addition: VisualAddition,
+    ) -> PDFGlyph {
+        let visual_index = match addition {
+            VisualAddition::Existing => *self
+                .visual_map
+                .get(&visual)
+                .expect("existing logical visual is missing from its map"),
+            VisualAddition::New(addition) => {
+                self.compact_glyphs.commit(addition);
+                let index = self.visuals.len();
+                self.visuals.push(visual.clone());
+                self.visual_map.insert(visual, index);
+                index
+            }
+        };
+
+        let cid = Cid::try_from(self.semantics.len() + 1)
+            .expect("logical font capacity was checked before allocation");
+        self.semantics.push(LogicalSemanticRecord {
+            text,
+            location,
+            visual: visual_index,
+        });
+        PDFGlyph::Cid(cid)
+    }
+
+    pub(crate) fn serialize(
+        &self,
+        sc: &mut SerializeContext,
+        chunk_container: &mut ChunkContainer,
+        root_ref: pdf_writer::Ref,
+    ) -> KrillaResult<()> {
+        let shard = match &self.identifier {
+            FontIdentifier::Logical(LogicalFontIdentifier(_, shard)) => *shard,
+            _ => unreachable!("logical font has a non-logical identifier"),
+        };
+        serialize_logical_font(
+            &self.font,
+            &self.visuals,
+            &self.semantics,
+            shard,
+            sc,
+            chunk_container,
+            root_ref,
+        )
+    }
+
+    #[cfg(test)]
+    fn semantic_count(&self) -> usize {
+        self.semantics.len()
+    }
+
+    #[cfg(test)]
+    fn visual_count(&self) -> usize {
+        self.visuals.len()
+    }
+
+    #[cfg(test)]
+    fn embedded_glyph_count(&self) -> usize {
+        self.compact_glyphs.glyph_count()
     }
 }
 
@@ -67,21 +157,33 @@ pub(crate) struct LogicalFontMapper {
     font: Font,
     semantic_records: FxHashMap<SemanticUnitKey, LogicalPdfGlyph>,
     shards: Vec<LogicalCIDFont>,
-    shard_capacity: usize,
+    semantic_shard_capacity: usize,
+    embedded_glyph_capacity: usize,
 }
 
 impl LogicalFontMapper {
     pub(crate) fn new(font: Font) -> Self {
-        Self::with_shard_capacity(font, usize::MAX)
+        Self::with_capacities(font, usize::MAX, usize::from(u16::MAX))
     }
 
+    #[cfg(test)]
     fn with_shard_capacity(font: Font, shard_capacity: usize) -> Self {
-        assert!(shard_capacity > 0);
+        Self::with_capacities(font, shard_capacity, usize::from(u16::MAX))
+    }
+
+    fn with_capacities(
+        font: Font,
+        semantic_shard_capacity: usize,
+        embedded_glyph_capacity: usize,
+    ) -> Self {
+        assert!(semantic_shard_capacity > 0);
+        assert!(embedded_glyph_capacity > 0);
         Self {
             font,
             semantic_records: FxHashMap::default(),
             shards: Vec::new(),
-            shard_capacity,
+            semantic_shard_capacity,
+            embedded_glyph_capacity,
         }
     }
 
@@ -100,19 +202,33 @@ impl LogicalFontMapper {
             return record.clone();
         }
 
-        let shard = match self.shards.last() {
-            Some(shard) if shard.has_capacity(self.shard_capacity) => self.shards.len() - 1,
-            _ => {
+        let (shard, addition) = match self.shards.last().and_then(|shard| {
+            shard
+                .plan_addition(
+                    &key.visual,
+                    self.semantic_shard_capacity,
+                    self.embedded_glyph_capacity,
+                )
+                .map(|addition| (self.shards.len() - 1, addition))
+        }) {
+            Some(planned) => planned,
+            None => {
                 let index = self.shards.len();
-                self.shards
-                    .push(LogicalCIDFont::new(self.font.clone(), index));
-                index
+                let shard = LogicalCIDFont::new(self.font.clone(), index);
+                let addition = shard
+                    .plan_addition(
+                        &key.visual,
+                        self.semantic_shard_capacity,
+                        self.embedded_glyph_capacity,
+                    )
+                    .expect("one logical visual exceeds the physical font capacity");
+                self.shards.push(shard);
+                (index, addition)
             }
         };
         let identifier = self.shards[shard].identifier();
-        let glyph = self.shards[shard]
-            .add(key.text.clone(), key.visual.clone(), location)
-            .expect("new logical font shard must have glyph capacity");
+        let glyph =
+            self.shards[shard].add(key.text.clone(), key.visual.clone(), location, addition);
         let result = LogicalPdfGlyph { identifier, glyph };
         self.semantic_records.insert(key, result.clone());
         result
@@ -148,24 +264,32 @@ mod tests {
         let second = mapper.add("A".into(), visual(36), None);
 
         assert_eq!(first.identifier, second.identifier);
-        assert_eq!(mapper.fonts()[0].logical_count, 1);
+        assert_eq!(mapper.fonts()[0].semantic_count(), 1);
+        assert_eq!(mapper.fonts()[0].visual_count(), 1);
     }
 
     #[test]
-    fn different_semantics_use_distinct_cids() {
+    fn different_semantics_share_one_visual_glyph() {
         let mut mapper = LogicalFontMapper::new(font());
         mapper.add("A".into(), visual(36), None);
         mapper.add("different semantics".into(), visual(36), None);
 
-        assert_eq!(mapper.fonts()[0].logical_count, 2);
-        assert_ne!(
-            mapper.fonts()[0].cid_font.get_codepoints(1),
-            mapper.fonts()[0].cid_font.get_codepoints(2)
-        );
+        assert_eq!(mapper.fonts()[0].semantic_count(), 2);
+        assert_eq!(mapper.fonts()[0].visual_count(), 1);
     }
 
     #[test]
-    fn capacity_exhaustion_creates_a_new_identity_shard() {
+    fn different_visuals_get_distinct_embedded_glyphs() {
+        let mut mapper = LogicalFontMapper::new(font());
+        mapper.add("A".into(), visual(36), None);
+        mapper.add("A".into(), visual(37), None);
+
+        assert_eq!(mapper.fonts()[0].semantic_count(), 2);
+        assert_eq!(mapper.fonts()[0].visual_count(), 2);
+    }
+
+    #[test]
+    fn semantic_capacity_exhaustion_creates_a_new_shard() {
         let mut mapper = LogicalFontMapper::with_shard_capacity(font(), 2);
         let first = mapper.add("A".into(), visual(36), None);
         mapper.add("B".into(), visual(36), None);
@@ -173,22 +297,19 @@ mod tests {
 
         assert_ne!(first.identifier, third.identifier);
         assert_eq!(mapper.fonts().len(), 2);
-        assert_eq!(mapper.fonts()[0].logical_count, 2);
-        assert_eq!(mapper.fonts()[1].logical_count, 1);
+        assert_eq!(mapper.fonts()[0].semantic_count(), 2);
+        assert_eq!(mapper.fonts()[1].semantic_count(), 1);
     }
 
     #[test]
-    fn true_type_glyph_limit_creates_a_new_identity_shard() {
-        let font = font();
-        let capacity = usize::from(u16::MAX) + 1 - font.num_glyphs() as usize;
-        let mut mapper = LogicalFontMapper::new(font);
-        let visual = visual(36);
-        for index in 0..=capacity {
-            mapper.add(index.to_string(), visual.clone(), None);
-        }
+    fn compact_embedded_glyph_capacity_creates_a_new_shard() {
+        let mut mapper = LogicalFontMapper::with_capacities(font(), usize::MAX, 3);
+        let first = mapper.add("A".into(), visual(36), None);
+        let second = mapper.add("B".into(), visual(37), None);
 
+        assert_ne!(first.identifier, second.identifier);
         assert_eq!(mapper.fonts().len(), 2);
-        assert_eq!(mapper.fonts()[0].logical_count, capacity);
-        assert_eq!(mapper.fonts()[1].logical_count, 1);
+        assert_eq!(mapper.fonts()[0].embedded_glyph_count(), 3);
+        assert_eq!(mapper.fonts()[1].embedded_glyph_count(), 3);
     }
 }
