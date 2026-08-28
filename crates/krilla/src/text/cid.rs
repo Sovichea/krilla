@@ -21,8 +21,9 @@ use crate::serialize::SerializeContext;
 use crate::stream::FilterStreamBuilder;
 use crate::surface::Location;
 use crate::text::logical::VisualUnitKey;
+use crate::text::logical_font::LogicalSemanticRecord;
 use crate::text::outline::OutlineBuilder;
-use crate::text::truetype_logical::{synthesize_logical_glyphs, SyntheticLogicalGlyph};
+use crate::text::truetype_logical::build_compact_logical_font;
 use crate::text::Font;
 use crate::text::GlyphId;
 use crate::util::{stable_hash128, SliceExt};
@@ -115,24 +116,12 @@ pub(crate) struct CIDFont {
     cmap_entries: FxHashMap<u16, (String, Option<Location>)>,
     /// The widths of the glyphs, _indexed by their CID_.
     widths: Vec<f32>,
-    /// Synthetic glyph definitions in virtual-GID allocation order.
-    synthetic_logical_glyphs: Vec<SyntheticLogicalGlyph>,
-    /// Distinguishes independent logical font shards with otherwise identical subsets.
-    subset_salt: Option<usize>,
     is_empty: bool,
 }
 
 impl CIDFont {
     /// Create a new CID-keyed font.
     pub(crate) fn new(font: Font) -> CIDFont {
-        Self::new_with_salt(font, None)
-    }
-
-    pub(crate) fn new_logical(font: Font, shard: usize) -> CIDFont {
-        Self::new_with_salt(font, Some(shard))
-    }
-
-    fn new_with_salt(font: Font, subset_salt: Option<usize>) -> CIDFont {
         // Always include the .notdef glyph. Will also always be included by the subsetter in
         // the glyph remapper.
         let widths = vec![font.advance_width(GlyphId::new(0)).unwrap_or(0.0)];
@@ -141,8 +130,6 @@ impl CIDFont {
             glyph_remapper: GlyphRemapper::new(),
             cmap_entries: FxHashMap::default(),
             widths,
-            synthetic_logical_glyphs: Vec::new(),
-            subset_salt,
             font,
             is_empty: true,
         }
@@ -185,38 +172,6 @@ impl CIDFont {
         new_id
     }
 
-    pub(crate) fn remaining_logical_glyph_capacity(&self) -> usize {
-        (usize::from(u16::MAX) + 1)
-            .saturating_sub(self.font.num_glyphs() as usize)
-            .saturating_sub(self.synthetic_logical_glyphs.len())
-    }
-
-    /// Add one synthetic visual unit and return its CID.
-    pub(crate) fn add_logical_visual(&mut self, visual: VisualUnitKey) -> Option<Cid> {
-        if self.remaining_logical_glyph_capacity() == 0 {
-            return None;
-        }
-        self.is_empty = false;
-        let base = self.font.num_glyphs();
-        let index = u32::try_from(self.synthetic_logical_glyphs.len())
-            .expect("logical glyph count exceeds u32");
-        let virtual_gid = base
-            .checked_add(index)
-            .and_then(|gid| u16::try_from(gid).ok())
-            .expect("logical glyph capacity was checked before allocation");
-        let cid = self.glyph_remapper.remap(virtual_gid);
-
-        if cid as usize >= self.widths.len() {
-            self.widths.push(visual.advance_width as f32);
-        }
-        self.synthetic_logical_glyphs.push(SyntheticLogicalGlyph {
-            virtual_gid,
-            visual,
-        });
-
-        Some(cid)
-    }
-
     #[inline]
     pub(crate) fn get_codepoints(&self, cid: Cid) -> Option<&str> {
         self.cmap_entries.get(&cid).map(|s| s.0.as_str())
@@ -248,11 +203,7 @@ impl CIDFont {
         let data_ref = sc.new_ref();
 
         let glyph_remapper = &self.glyph_remapper;
-        let embedding_font = if self.synthetic_logical_glyphs.is_empty() {
-            self.font.clone()
-        } else {
-            synthesize_logical_glyphs(&self.font, &self.synthetic_logical_glyphs)?
-        };
+        let embedding_font = self.font.clone();
 
         let is_glyf = embedding_font.font_ref().glyf().is_ok();
         let is_cff = embedding_font.font_ref().cff().is_ok();
@@ -306,11 +257,7 @@ impl CIDFont {
             FilterStreamBuilder::new_from_binary_data(data).finish(&sc.serialize_settings())
         };
 
-        let base_font = if let Some(salt) = self.subset_salt {
-            base_font_name(&self.font, &(&self.glyph_remapper, salt))
-        } else {
-            base_font_name(&self.font, &self.glyph_remapper)
-        };
+        let base_font = base_font_name(&self.font, &self.glyph_remapper);
         let base_font_type0 = if is_cff {
             format!("{base_font}-{IDENTITY_H}")
         } else {
@@ -465,6 +412,188 @@ impl CIDFont {
 
         Ok(())
     }
+}
+
+pub(crate) fn serialize_logical_font(
+    font: &Font,
+    visuals: &[VisualUnitKey],
+    semantics: &[LogicalSemanticRecord],
+    shard: usize,
+    sc: &mut SerializeContext,
+    chunk_container: &mut ChunkContainer,
+    root_ref: Ref,
+) -> KrillaResult<()> {
+    let compact = build_compact_logical_font(font, visuals)?;
+    let embedding_font = compact.font;
+    let visual_gids = compact.visual_gids;
+
+    let mut cid_to_gid = Vec::with_capacity(semantics.len() + 1);
+    cid_to_gid.push(0_u16);
+    let mut widths = Vec::with_capacity(semantics.len() + 1);
+    widths.push(font.advance_width(GlyphId::new(0)).unwrap_or(0.0));
+    let mut cmap_entries = FxHashMap::default();
+    for (index, semantic) in semantics.iter().enumerate() {
+        let cid =
+            u16::try_from(index + 1).expect("logical CID count was checked during allocation");
+        let visual = visuals
+            .get(semantic.visual)
+            .expect("logical semantic record references an unknown visual");
+        cid_to_gid.push(
+            *visual_gids
+                .get(semantic.visual)
+                .expect("logical visual is missing an embedded GID"),
+        );
+        widths.push(visual.advance_width as f32);
+        cmap_entries.insert(cid, (semantic.text.clone(), semantic.location));
+    }
+
+    let chunk = &mut chunk_container.non_stream.fonts;
+    let mut stream_chunk = sc.new_chunk();
+    let cid_ref = sc.new_ref();
+    let descriptor_ref = sc.new_ref();
+    let cmap_ref = sc.new_ref();
+    let cid_set_ref = sc.new_ref();
+    let data_ref = sc.new_ref();
+    let cid_to_gid_ref = sc.new_ref();
+
+    if font
+        .font_ref()
+        .os2()
+        .is_ok_and(|os2| os2.fs_type() & 0xF == 2)
+    {
+        sc.register_validation_error(ValidationError::RestrictedLicense(font.clone()));
+    }
+
+    let mut global_bbox = embedding_font.bbox();
+    let mut path_bbox = None;
+    for gid in 0..embedding_font.num_glyphs() {
+        if let Some(glyph_bbox) = compute_bbox(&embedding_font, skrifa::GlyphId::new(gid)) {
+            path_bbox = path_bbox
+                .map(|mut current: Rect| {
+                    current.expand(&glyph_bbox);
+                    current
+                })
+                .or(Some(glyph_bbox));
+        }
+    }
+    if let Some(path_bbox) = path_bbox {
+        global_bbox = path_bbox;
+    }
+
+    let subsetted_data = embedding_font.font_data().0;
+    let font_stream = FilterStreamBuilder::new_from_binary_data(subsetted_data.as_ref().as_ref())
+        .finish(&sc.serialize_settings());
+    let base_font = base_font_name(font, &(&visual_gids, &cid_to_gid, shard));
+
+    chunk
+        .type0_font(root_ref)
+        .base_font(Name(base_font.as_bytes()))
+        .encoding_predefined(Name(IDENTITY_H.as_bytes()))
+        .descendant_font(cid_ref)
+        .to_unicode(cmap_ref);
+
+    let mut cid_font = chunk.cid_font(cid_ref);
+    cid_font.subtype(CidFontType::Type2);
+    cid_font.base_font(Name(base_font.as_bytes()));
+    cid_font.system_info(SYSTEM_INFO);
+    cid_font.font_descriptor(descriptor_ref);
+    cid_font.default_width(0.0);
+    cid_font.cid_to_gid_map_stream(cid_to_gid_ref);
+
+    let to_pdf_units = |value: f32| value / font.units_per_em() * PDF_UNITS_PER_EM;
+    let mut first = 0;
+    let mut width_writer = cid_font.widths();
+    for (width, group) in widths.group_by_key(|&width| width) {
+        let end = first + group.len();
+        if width != 0.0 {
+            width_writer.same(first as u16, (end - 1) as u16, to_pdf_units(width));
+        }
+        first = end;
+    }
+    width_writer.finish();
+    cid_font.finish();
+
+    if !sc.serialize_settings().pdf_version().deprecates_cid_set() {
+        let cid_count = semantics.len() + 1;
+        let mut bytes = vec![0xFF; cid_count / 8];
+        let padding = cid_count % 8;
+        if padding != 0 {
+            bytes.push(!(0xFF >> padding));
+        }
+        let cid_stream =
+            FilterStreamBuilder::new_from_binary_data(&bytes).finish(&sc.serialize_settings());
+        let mut stream = stream_chunk.stream(cid_set_ref, cid_stream.encoded_data());
+        cid_stream.write_filters(stream.deref_mut());
+        stream.finish();
+        cid_stream.finish();
+    }
+
+    let mut flags = FontFlags::empty();
+    flags.set(
+        FontFlags::SERIF,
+        font.postscript_name()
+            .is_some_and(|name| name.contains("Serif")),
+    );
+    flags.set(FontFlags::FIXED_PITCH, font.is_monospaced());
+    flags.set(FontFlags::ITALIC, font.italic_angle() != 0.0);
+    flags.insert(FontFlags::SYMBOLIC);
+    flags.insert(FontFlags::SMALL_CAP);
+
+    let bbox = Rect::from_ltrb(
+        to_pdf_units(global_bbox.left()),
+        to_pdf_units(global_bbox.top()),
+        to_pdf_units(global_bbox.right()),
+        to_pdf_units(global_bbox.bottom()),
+    )
+    .unwrap()
+    .to_pdf_rect();
+    let ascender = to_pdf_units(font.ascent());
+    let mut descriptor = chunk.font_descriptor(descriptor_ref);
+    descriptor
+        .name(Name(base_font.as_bytes()))
+        .flags(flags)
+        .bbox(bbox)
+        .italic_angle(font.italic_angle())
+        .ascent(ascender)
+        .descent(to_pdf_units(font.descent()))
+        .cap_height(font.cap_height().map(to_pdf_units).unwrap_or(ascender))
+        .stem_v(10.0 + 0.244 * (font.weight() - 50.0));
+    if !sc.serialize_settings().pdf_version().deprecates_cid_set() {
+        descriptor.cid_set(cid_set_ref);
+    }
+    descriptor.font_file2(data_ref);
+    descriptor.finish();
+
+    let mut unicode_cmap = UnicodeCmap::new(CMAP_NAME, SYSTEM_INFO);
+    for cid in 1..cid_to_gid.len() {
+        let cid = u16::try_from(cid).expect("logical CID count exceeds u16");
+        write_cmap_entry(font, cmap_entries.get(&cid), sc, &mut unicode_cmap, cid);
+    }
+    let unicode_cmap = unicode_cmap.finish();
+    let cmap_stream =
+        FilterStreamBuilder::new_from_content_stream(&unicode_cmap, &sc.serialize_settings())
+            .finish(&sc.serialize_settings());
+    let mut cmap = stream_chunk.cmap(cmap_ref, cmap_stream.encoded_data());
+    cmap_stream.write_filters(cmap.deref_mut().deref_mut());
+    cmap.writing_mode(WMode::Horizontal);
+    cmap.finish();
+
+    let mut gid_bytes = Vec::with_capacity(cid_to_gid.len() * 2);
+    for gid in cid_to_gid {
+        gid_bytes.extend_from_slice(&gid.to_be_bytes());
+    }
+    let gid_map_stream =
+        FilterStreamBuilder::new_from_binary_data(&gid_bytes).finish(&sc.serialize_settings());
+    let mut gid_map = stream_chunk.stream(cid_to_gid_ref, gid_map_stream.encoded_data());
+    gid_map_stream.write_filters(gid_map.deref_mut());
+    gid_map.finish();
+    gid_map_stream.finish();
+
+    let mut stream = stream_chunk.stream(data_ref, font_stream.encoded_data());
+    font_stream.write_filters(stream.deref_mut());
+    stream.finish();
+    chunk_container.streams.fonts.push(stream_chunk);
+    Ok(())
 }
 
 /// Create a tag for a font subset.

@@ -1,9 +1,13 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
+use skrifa::raw::tables::glyf::Glyph;
+use skrifa::raw::TableProvider;
+use subsetter::GlyphRemapper;
+
 use crate::error::{KrillaError, KrillaResult};
 use crate::text::logical::VisualUnitKey;
-use crate::text::Font;
+use crate::text::{Font, GlyphId};
 
 const HEAD: [u8; 4] = *b"head";
 const HHEA: [u8; 4] = *b"hhea";
@@ -26,6 +30,206 @@ const HAVE_2X2: u16 = 0x0080;
 pub(crate) struct SyntheticLogicalGlyph {
     pub(crate) virtual_gid: u16,
     pub(crate) visual: VisualUnitKey,
+}
+
+pub(crate) struct CompactLogicalFont {
+    pub(crate) font: Font,
+    /// Embedded GID for each input visual unit.
+    pub(crate) visual_gids: Vec<u16>,
+}
+
+pub(crate) struct CompactGlyphAddition {
+    source_glyphs: Vec<u16>,
+    synthetic: bool,
+}
+
+#[derive(Clone)]
+pub(crate) struct CompactGlyphTracker {
+    source_glyphs: HashSet<u16>,
+    synthetic_visuals: usize,
+}
+
+impl CompactGlyphTracker {
+    pub(crate) fn new() -> Self {
+        Self {
+            source_glyphs: HashSet::from([0]),
+            synthetic_visuals: 0,
+        }
+    }
+
+    pub(crate) fn plan(
+        &self,
+        font: &Font,
+        visual: &VisualUnitKey,
+    ) -> KrillaResult<CompactGlyphAddition> {
+        let loca = font
+            .font_ref()
+            .loca(None)
+            .map_err(|_| font_error(font, "failed to read loca for logical font capacity"))?;
+        let glyf = font
+            .font_ref()
+            .glyf()
+            .map_err(|_| font_error(font, "failed to read glyf for logical font capacity"))?;
+        let mut pending = HashSet::new();
+        let mut stack = Vec::with_capacity(visual.components.len());
+        for component in &visual.components {
+            let gid = u16::try_from(component.glyph_id).map_err(|_| {
+                font_error(font, "logical component glyph ID does not fit TrueType")
+            })?;
+            if u32::from(gid) >= font.num_glyphs() {
+                return Err(font_error(
+                    font,
+                    "logical component glyph ID exceeds the source font",
+                ));
+            }
+            stack.push(gid);
+        }
+
+        while let Some(gid) = stack.pop() {
+            if self.source_glyphs.contains(&gid) || !pending.insert(gid) {
+                continue;
+            }
+            let glyph = loca
+                .get_glyf(skrifa::raw::types::GlyphId::new(u32::from(gid)), &glyf)
+                .map_err(|_| font_error(font, "failed to read logical source glyph"))?;
+            if let Some(Glyph::Composite(composite)) = glyph {
+                stack.extend(
+                    composite
+                        .component_glyphs_and_flags()
+                        .map(|(component, _)| component.to_u16()),
+                );
+            }
+        }
+
+        Ok(CompactGlyphAddition {
+            source_glyphs: pending.into_iter().collect(),
+            synthetic: exact_source_gid(font, visual).is_none(),
+        })
+    }
+
+    pub(crate) fn can_commit(&self, addition: &CompactGlyphAddition, limit: usize) -> bool {
+        self.glyph_count()
+            .checked_add(addition.source_glyphs.len())
+            .and_then(|count| count.checked_add(usize::from(addition.synthetic)))
+            .is_some_and(|count| count <= limit && count <= usize::from(u16::MAX))
+    }
+
+    pub(crate) fn commit(&mut self, addition: CompactGlyphAddition) {
+        self.source_glyphs.extend(addition.source_glyphs);
+        self.synthetic_visuals += usize::from(addition.synthetic);
+    }
+
+    pub(crate) fn glyph_count(&self) -> usize {
+        self.source_glyphs.len() + self.synthetic_visuals
+    }
+}
+
+/// Build a compact logical font from only the source components and visual
+/// constructions used by one logical PDF font shard.
+pub(crate) fn build_compact_logical_font(
+    font: &Font,
+    visuals: &[VisualUnitKey],
+) -> KrillaResult<CompactLogicalFont> {
+    let mut source_remapper = GlyphRemapper::new();
+    for visual in visuals {
+        for component in &visual.components {
+            let source_gid = u16::try_from(component.glyph_id).map_err(|_| {
+                font_error(font, "logical component glyph ID does not fit TrueType")
+            })?;
+            if u32::from(source_gid) >= font.num_glyphs() {
+                return Err(font_error(
+                    font,
+                    "logical component glyph ID exceeds the source font",
+                ));
+            }
+            source_remapper.remap(source_gid);
+        }
+    }
+
+    let compact_source = subset_source_font(font, &source_remapper)?;
+    let synthetic_base = compact_source.num_glyphs();
+    let mut synthetic = Vec::new();
+    let mut visual_gids = Vec::with_capacity(visuals.len());
+
+    for visual in visuals {
+        if let Some(source_gid) = exact_source_gid(font, visual) {
+            let embedded_gid = source_remapper
+                .get(source_gid)
+                .expect("source-backed visual was added to the remapper");
+            visual_gids.push(embedded_gid);
+            continue;
+        }
+
+        let mut remapped = visual.clone();
+        for component in &mut remapped.components {
+            let source_gid = u16::try_from(component.glyph_id).map_err(|_| {
+                font_error(font, "logical component glyph ID does not fit TrueType")
+            })?;
+            component.glyph_id = u32::from(
+                source_remapper
+                    .get(source_gid)
+                    .expect("logical component was added to the remapper"),
+            );
+        }
+
+        let index = u32::try_from(synthetic.len())
+            .map_err(|_| font_error(font, "too many synthetic logical glyphs"))?;
+        let virtual_gid = synthetic_base
+            .checked_add(index)
+            .and_then(|gid| u16::try_from(gid).ok())
+            .ok_or_else(|| font_error(font, "compact logical font glyph limit exceeded"))?;
+        synthetic.push(SyntheticLogicalGlyph {
+            virtual_gid,
+            visual: remapped,
+        });
+        visual_gids.push(virtual_gid);
+    }
+
+    let compact = synthesize_logical_glyphs(&compact_source, &synthetic)?;
+    Ok(CompactLogicalFont {
+        font: compact,
+        visual_gids,
+    })
+}
+
+fn exact_source_gid(font: &Font, visual: &VisualUnitKey) -> Option<u16> {
+    let [component] = visual.components.as_slice() else {
+        return None;
+    };
+    if component.x != 0 || component.y != 0 {
+        return None;
+    }
+
+    let source_gid = u16::try_from(component.glyph_id).ok()?;
+    if u32::from(source_gid) >= font.num_glyphs() {
+        return None;
+    }
+    let nominal_advance = font
+        .advance_width(GlyphId::new(component.glyph_id))?
+        .round() as i32;
+    (nominal_advance == visual.advance_width).then_some(source_gid)
+}
+
+fn subset_source_font(font: &Font, remapper: &GlyphRemapper) -> KrillaResult<Font> {
+    let variation_coordinates = font
+        .variation_coordinates()
+        .iter()
+        .map(|value| (subsetter::Tag::new(value.0.get()), value.1.get()))
+        .collect::<Vec<_>>();
+    let data = subsetter::subset_with_variations(
+        font.font_data().as_ref(),
+        font.index(),
+        &variation_coordinates,
+        remapper,
+    )
+    .map_err(|error| {
+        KrillaError::Font(
+            font.clone(),
+            format!("failed to compact logical font: {error}"),
+        )
+    })?;
+    Font::new(Arc::new(data).into(), 0)
+        .ok_or_else(|| font_error(font, "failed to read compact logical font"))
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -687,4 +891,68 @@ fn push_i16(data: &mut Vec<u8>, value: i16) {
 
 fn font_error(font: &Font, message: &str) -> KrillaError {
     KrillaError::Font(font.clone(), message.to_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::build_compact_logical_font;
+    use crate::text::logical::{LogicalComponent, VisualUnitKey};
+    use crate::text::{Font, GlyphId};
+
+    fn font() -> Font {
+        let data = include_bytes!("../../../../assets/fonts/NotoSans-Regular.ttf");
+        Font::new(data.as_slice().into(), 0).unwrap()
+    }
+
+    fn source_visual(font: &Font, glyph_id: u32) -> VisualUnitKey {
+        VisualUnitKey {
+            advance_width: font.advance_width(GlyphId::new(glyph_id)).unwrap().round() as i32,
+            components: vec![LogicalComponent {
+                glyph_id,
+                x: 0,
+                y: 0,
+            }],
+        }
+    }
+
+    #[test]
+    fn exact_source_visual_uses_the_compact_source_gid() {
+        let font = font();
+        let compact = build_compact_logical_font(&font, &[source_visual(&font, 36)]).unwrap();
+
+        assert_eq!(compact.font.num_glyphs(), 2);
+        assert_eq!(compact.visual_gids, vec![1]);
+    }
+
+    #[test]
+    fn changed_advance_appends_one_compact_synthetic_glyph() {
+        let font = font();
+        let mut visual = source_visual(&font, 36);
+        visual.advance_width -= 1;
+        let compact = build_compact_logical_font(&font, &[visual]).unwrap();
+
+        assert_eq!(compact.font.num_glyphs(), 3);
+        assert_eq!(compact.visual_gids, vec![2]);
+    }
+
+    #[test]
+    fn source_and_synthetic_visuals_share_compact_components() {
+        let font = font();
+        let source = source_visual(&font, 36);
+        let synthetic = VisualUnitKey {
+            advance_width: source.advance_width,
+            components: vec![
+                source.components[0].clone(),
+                LogicalComponent {
+                    glyph_id: 37,
+                    x: 10,
+                    y: 20,
+                },
+            ],
+        };
+        let compact = build_compact_logical_font(&font, &[source, synthetic]).unwrap();
+
+        assert_eq!(compact.font.num_glyphs(), 4);
+        assert_eq!(compact.visual_gids, vec![1, 3]);
+    }
 }
