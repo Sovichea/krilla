@@ -27,10 +27,10 @@ without having to worry about low-level details.
 - Optional support for multi-threading via `rayon`, allowing for great speedups when creating
 compressed PDFs or PDF with lots of images.
 
-The logical text implementation and its compatibility tradeoffs are documented by
-architecture version: [Version 1](PDF_LOGICAL_UNITS_V1.md),
-[Version 2](PDF_LOGICAL_UNITS_V2.md), [Version 3](PDF_LOGICAL_UNITS_V3.md), and
-[Version 4](PDF_LOGICAL_UNITS_V4.md).
+The complete logical-text architecture and its compatibility tradeoffs are documented in
+[PDF logical text units](PDF_LOGICAL_UNITS.md). Historical design changes are recorded in
+[Version 1](PDF_LOGICAL_UNITS_V1.md), [Version 2](PDF_LOGICAL_UNITS_V2.md),
+[Version 3](PDF_LOGICAL_UNITS_V3.md), and [Version 4](PDF_LOGICAL_UNITS_V4.md).
 
 In addition to that, the library also supports the following PDF features:
 - Great subsetting for both, CFF-flavored and TTF-flavored fonts, ensuring small file sizes.
