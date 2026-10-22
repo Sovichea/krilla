@@ -159,7 +159,7 @@ impl FontContainer {
         text: String,
         visual: VisualUnitKey,
         location: Option<crate::surface::Location>,
-    ) -> LogicalPdfGlyph {
+    ) -> crate::error::KrillaResult<LogicalPdfGlyph> {
         self.logical_mapper.add(text, visual, location)
     }
 }

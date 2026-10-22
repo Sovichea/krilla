@@ -284,6 +284,9 @@ pub(crate) struct SerializeContext {
     validation_store: ValidationStore,
     /// The current location, if set.
     pub(crate) location: Option<Location>,
+    /// A fatal error encountered while building content that cannot be reported
+    /// immediately because the public drawing APIs are infallible.
+    fatal_error: Option<KrillaError>,
 }
 
 impl SerializeContext {
@@ -317,6 +320,7 @@ impl SerializeContext {
             chunk_settings,
             limits: Limits::new(),
             validation_store: ValidationStore::new(),
+            fatal_error: None,
         }
     }
 
@@ -458,6 +462,10 @@ impl SerializeContext {
     }
 
     pub(crate) fn finish(mut self, mut chunk_container: ChunkContainer) -> KrillaResult<Pdf> {
+        if let Some(error) = self.fatal_error.take() {
+            return Err(error);
+        }
+
         // We need to be careful here that we serialize the objects in the right order,
         // as in some cases we use MaybeTake::take to remove an object, which means that
         // no object that is serialized afterwards must depend on it.
@@ -515,6 +523,12 @@ impl SerializeContext {
 
 /// Various registration methods.
 impl SerializeContext {
+    pub(crate) fn register_error(&mut self, error: KrillaError) {
+        if self.fatal_error.is_none() {
+            self.fatal_error = Some(error);
+        }
+    }
+
     pub(crate) fn register_validation_error(&mut self, error: ValidationError) {
         if let Some(validators) = self.serialize_settings().validators().prohibits(&error) {
             self.validation_errors.push((error, validators))

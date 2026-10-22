@@ -62,6 +62,13 @@ impl CompactGlyphTracker {
         font: &Font,
         visual: &VisualUnitKey,
     ) -> KrillaResult<CompactGlyphAddition> {
+        if font.pdf_logical_unit_support() == PdfLogicalUnitSupport::Unsupported {
+            return Err(font_error(
+                font,
+                "PDF logical units require TrueType glyf outlines; CFF and CFF2 fonts are not supported",
+            ));
+        }
+
         let loca = font
             .font_ref()
             .loca(None)
@@ -88,6 +95,14 @@ impl CompactGlyphTracker {
         while let Some(gid) = stack.pop() {
             if self.source_glyphs.contains(&gid) || !pending.insert(gid) {
                 continue;
+            }
+            if crate::text::glyph::has_color_glyph_data(font, GlyphId::new(u32::from(gid))) {
+                return Err(font_error(
+                    font,
+                    &format!(
+                        "logical unit references color glyph {gid}, which cannot be represented by TrueType outline synthesis"
+                    ),
+                ));
             }
             let glyph = loca
                 .get_glyf(skrifa::raw::types::GlyphId::new(u32::from(gid)), &glyf)
@@ -284,10 +299,6 @@ pub(crate) fn synthesize_logical_glyphs(
     font: &Font,
     logical_glyphs: &[SyntheticLogicalGlyph],
 ) -> KrillaResult<Font> {
-    if logical_glyphs.is_empty() {
-        return Ok(font.clone());
-    }
-
     // Variable TrueType fonts are instantiated by the subsetter before this
     // point, so the compact source font and every synthetic glyph use static
     // outlines for the requested variation coordinates.
@@ -430,7 +441,7 @@ pub(crate) fn synthesize_logical_glyphs(
     if hhea.len() < 36 {
         return Err(font_error(font, "hhea table is too short"));
     }
-    write_u16(&mut hhea, 34, total_glyphs, font)?;
+    update_hhea_metrics(&mut hhea, &metrics, &glyf, &new_loca, total_glyphs, font)?;
     parsed.tables.insert(HHEA, hhea);
     parsed.tables.insert(HMTX, serialize_hmetrics(&metrics));
     parsed.tables.insert(GLYF, glyf);
@@ -446,6 +457,55 @@ pub(crate) fn synthesize_logical_glyphs(
     let data = parsed.build(font)?;
     Font::new(Arc::new(data).into(), 0)
         .ok_or_else(|| font_error(font, "failed to read synthesized logical TrueType font"))
+}
+
+fn update_hhea_metrics(
+    hhea: &mut [u8],
+    metrics: &[(u16, i16)],
+    glyf: &[u8],
+    loca: &[u32],
+    glyph_count: u16,
+    font: &Font,
+) -> KrillaResult<()> {
+    if metrics.len() != usize::from(glyph_count) {
+        return Err(font_error(
+            font,
+            "horizontal metrics do not match the final glyph set",
+        ));
+    }
+
+    let mut advance_width_max = 0_u16;
+    let mut min_left_side_bearing = i32::MAX;
+    let mut min_right_side_bearing = i32::MAX;
+    let mut max_extent = i32::MIN;
+
+    for gid in 0..glyph_count {
+        let (advance, left_side_bearing) = metrics[usize::from(gid)];
+        let bbox = glyph_bbox(gid, glyf, loca, font)?;
+        let glyph_width = i32::from(bbox.x_max) - i32::from(bbox.x_min);
+        if glyph_width < 0 {
+            return Err(font_error(font, "glyph bounding box has a negative width"));
+        }
+
+        let right_side_bearing = i32::from(advance) - i32::from(left_side_bearing) - glyph_width;
+        let extent = i32::from(left_side_bearing) + glyph_width;
+
+        advance_width_max = advance_width_max.max(advance);
+        min_left_side_bearing = min_left_side_bearing.min(i32::from(left_side_bearing));
+        min_right_side_bearing = min_right_side_bearing.min(right_side_bearing);
+        max_extent = max_extent.max(extent);
+    }
+
+    if glyph_count == 0 {
+        return Err(font_error(font, "compact logical font contains no glyphs"));
+    }
+
+    write_u16(hhea, 10, advance_width_max, font)?;
+    write_i16(hhea, 12, checked_i16(min_left_side_bearing, font)?, font)?;
+    write_i16(hhea, 14, checked_i16(min_right_side_bearing, font)?, font)?;
+    write_i16(hhea, 16, checked_i16(max_extent, font)?, font)?;
+    write_u16(hhea, 34, glyph_count, font)?;
+    Ok(())
 }
 
 fn build_composite(
@@ -937,7 +997,12 @@ fn font_error(font: &Font, message: &str) -> KrillaError {
 
 #[cfg(test)]
 mod tests {
-    use super::build_compact_logical_font;
+    use skrifa::raw::TableProvider;
+
+    use super::{
+        build_compact_logical_font, glyph_bbox, parse_hmetrics, parse_loca, read_i16, read_u16,
+        required_table, update_hhea_metrics, ParsedFont, GLYF, HEAD, LOCA, MAXP,
+    };
     use crate::text::logical::{LogicalComponent, VisualUnitKey};
     use crate::text::{Font, GlyphId, PdfLogicalUnitSupport, Tag};
 
@@ -1019,6 +1084,129 @@ mod tests {
 
         assert_eq!(compact.font.num_glyphs(), 3);
         assert_eq!(compact.visual_gids, vec![2]);
+    }
+
+    fn assert_hhea_consistent(font: &Font) {
+        let hhea = font.font_ref().hhea().unwrap();
+        let data = font.font_data();
+        let parsed = ParsedFont::parse(data.as_ref(), font).unwrap();
+        let maxp = required_table(&parsed.tables, MAXP, font).unwrap();
+        let glyph_count = read_u16(maxp, 4, font).unwrap();
+        let head = required_table(&parsed.tables, HEAD, font).unwrap();
+        let loca_format = read_i16(head, 50, font).unwrap();
+        let glyf = required_table(&parsed.tables, GLYF, font).unwrap();
+        let loca = parse_loca(
+            required_table(&parsed.tables, LOCA, font).unwrap(),
+            glyph_count,
+            loca_format,
+            glyf.len(),
+            font,
+        )
+        .unwrap();
+        let metrics = parse_hmetrics(&parsed.tables, glyph_count, font).unwrap();
+
+        let mut advance_width_max = 0_u16;
+        let mut min_left_side_bearing = i32::MAX;
+        let mut min_right_side_bearing = i32::MAX;
+        let mut max_extent = i32::MIN;
+        for gid in 0..glyph_count {
+            let (advance, left_side_bearing) = metrics[usize::from(gid)];
+            let bbox = glyph_bbox(gid, glyf, &loca, font).unwrap();
+            let glyph_width = i32::from(bbox.x_max) - i32::from(bbox.x_min);
+            advance_width_max = advance_width_max.max(advance);
+            min_left_side_bearing = min_left_side_bearing.min(i32::from(left_side_bearing));
+            min_right_side_bearing = min_right_side_bearing
+                .min(i32::from(advance) - i32::from(left_side_bearing) - glyph_width);
+            max_extent = max_extent.max(i32::from(left_side_bearing) + glyph_width);
+        }
+
+        assert_eq!(hhea.number_of_h_metrics(), glyph_count);
+        assert_eq!(hhea.advance_width_max().to_u16(), advance_width_max);
+        assert_eq!(
+            hhea.min_left_side_bearing().to_i16(),
+            i16::try_from(min_left_side_bearing).unwrap()
+        );
+        assert_eq!(
+            hhea.min_right_side_bearing().to_i16(),
+            i16::try_from(min_right_side_bearing).unwrap()
+        );
+        assert_eq!(
+            hhea.x_max_extent().to_i16(),
+            i16::try_from(max_extent).unwrap()
+        );
+    }
+
+    #[test]
+    fn hhea_metrics_are_recomputed_for_source_backed_glyphs() {
+        let font = font();
+        let compact = build_compact_logical_font(&font, &[source_visual(&font, 36)]).unwrap();
+
+        assert_hhea_consistent(&compact.font);
+        assert_eq!(
+            compact
+                .font
+                .font_ref()
+                .hhea()
+                .unwrap()
+                .advance_width_max()
+                .to_u16(),
+            source_visual(&font, 36).advance_width as u16
+        );
+    }
+
+    #[test]
+    fn hhea_metrics_cover_synthetic_advances_and_offsets() {
+        let font = font();
+        let mut larger = source_visual(&font, 36);
+        larger.advance_width += 500;
+        let mut left = source_visual(&font, 36);
+        left.components[0].x = -200;
+        let mut right = source_visual(&font, 36);
+        right.components[0].x = 200;
+
+        let compact = build_compact_logical_font(&font, &[larger.clone(), left, right]).unwrap();
+
+        assert_hhea_consistent(&compact.font);
+        assert_eq!(
+            compact
+                .font
+                .font_ref()
+                .hhea()
+                .unwrap()
+                .advance_width_max()
+                .to_u16(),
+            larger.advance_width as u16
+        );
+        assert!(
+            compact
+                .font
+                .font_ref()
+                .hhea()
+                .unwrap()
+                .min_left_side_bearing()
+                .to_i16()
+                < 0
+        );
+    }
+
+    #[test]
+    fn hhea_metrics_are_recomputed_for_variable_and_collection_fonts() {
+        for font in [variable_font(700.0), collection_font(1)] {
+            let mut visual = source_visual(&font, 36);
+            visual.advance_width += 200;
+            let compact = build_compact_logical_font(&font, &[visual]).unwrap();
+            assert_hhea_consistent(&compact.font);
+        }
+    }
+
+    #[test]
+    fn unrepresentable_hhea_metrics_return_an_error() {
+        let font = font();
+        let mut hhea = [0_u8; 36];
+        let error = update_hhea_metrics(&mut hhea, &[(60_000, -20_000)], &[], &[0, 0], 1, &font)
+            .unwrap_err();
+
+        assert!(matches!(error, crate::error::KrillaError::Font(_, _)));
     }
 
     #[test]

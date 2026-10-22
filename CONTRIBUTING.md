@@ -31,3 +31,15 @@ make sure that Docker is enabled when running the tests.
 In addition to that, you can prepend `SKIP_SVG=1` to skip the SVG-related visual regression tests. You can prepend
 `REPLACE=1` to overwrite the currently existing references images/snapshots, and you can use `STORE=1` to store the
 final PDF version of each tests in the `store` directory, which makes it easier to manually inspect them.
+
+# Unicode extraction conformance
+
+The logical text conformance tests require Poppler's `pdftotext` (package
+`poppler-utils` on Debian/Ubuntu). Run them with:
+
+```text
+cargo test -p tests --features unicode-conformance logical_units
+```
+
+Without the feature they are reported as ignored, not as passing. CI installs
+Poppler and runs the feature-enabled suite explicitly.

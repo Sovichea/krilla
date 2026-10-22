@@ -35,7 +35,9 @@ jobs:
         run: docker pull vallaris/sitro-backends:latest
 
       - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y ghostscript libfontconfig1-dev
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ghostscript libfontconfig1-dev poppler-utils
 
       - name: Download Arlington model
         run: |
@@ -56,6 +58,9 @@ jobs:
 
       - name: Run tests
         run: cargo test --features visreg -- --nocapture
+
+      - name: Run Unicode extraction conformance tests
+        run: cargo test -p tests --features unicode-conformance logical_units -- --nocapture
 
       - name: Install pdfcpu
         run: |

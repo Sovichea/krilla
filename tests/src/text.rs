@@ -11,6 +11,7 @@ use krilla::surface::Surface;
 use krilla::text::{Font, GlyphId, KrillaGlyph, PdfLogicalUnit, Tag, TextDirection};
 use krilla::{Data, Document};
 use krilla_macros::{snapshot, visreg};
+use skrifa::MetadataProvider;
 
 use crate::{
     blue_fill, blue_stroke, red_fill, red_stroke, stops_with_3_solid_1, CANTARELL_VAR,
@@ -494,9 +495,79 @@ fn text_variable_font_cff2(surface: &mut Surface) {
     );
 }
 
+#[test]
+fn logical_units_reject_cff_fonts_without_panicking() {
+    let font = Font::new(LATIN_MODERN_ROMAN.clone(), 0).unwrap();
+    let glyph = KrillaGlyph::new(GlyphId::new(36), 0.6, 0.0, 0.0, 0.0, 0..1, None);
+    let glyphs = [glyph];
+    let units = [PdfLogicalUnit::new("A", &glyphs, 0.0, 0.0)];
+    let mut document = Document::new();
+    let mut page =
+        document.start_page_with(PageSettings::from_wh(200.0, 200.0).expect("valid page"));
+    let mut surface = page.surface();
+    surface.draw_pdf_logical_units(Point::from_xy(20.0, 60.0), &units, font, 24.0, false);
+    surface.finish();
+    page.finish();
+
+    assert!(matches!(
+        document.finish(),
+        Err(krilla::error::KrillaError::Font(_, _))
+    ));
+}
+
+#[test]
+fn logical_units_reject_color_glyphs_without_outlining() {
+    let font = Font::new(NOTO_COLOR_EMOJI_COLR.clone(), 0).unwrap();
+    let font_ref = skrifa::FontRef::new(NOTO_COLOR_EMOJI_COLR.as_ref()).unwrap();
+    let glyph_id = font_ref.charmap().map('😀').expect("emoji is in the font");
+    let glyph = KrillaGlyph::new(
+        GlyphId::new(glyph_id.to_u32()),
+        1.0,
+        0.0,
+        0.0,
+        0.0,
+        0..4,
+        None,
+    );
+    let glyphs = [glyph];
+    let units = [PdfLogicalUnit::new("😀", &glyphs, 0.0, 0.0)];
+    let mut document = Document::new();
+    let mut page =
+        document.start_page_with(PageSettings::from_wh(200.0, 200.0).expect("valid page"));
+    let mut surface = page.surface();
+    surface.draw_pdf_logical_units(Point::from_xy(20.0, 60.0), &units, font, 24.0, false);
+    surface.finish();
+    page.finish();
+
+    assert!(matches!(
+        document.finish(),
+        Err(krilla::error::KrillaError::Font(_, _))
+    ));
+}
+
+#[test]
+fn logical_units_reject_invalid_glyph_ids_without_panicking() {
+    let font = Font::new(NOTO_SANS.clone(), 0).unwrap();
+    let glyph = KrillaGlyph::new(GlyphId::new(u32::MAX), 0.6, 0.0, 0.0, 0.0, 0..1, None);
+    let glyphs = [glyph];
+    let units = [PdfLogicalUnit::new("A", &glyphs, 0.0, 0.0)];
+    let mut document = Document::new();
+    let mut page =
+        document.start_page_with(PageSettings::from_wh(200.0, 200.0).expect("valid page"));
+    let mut surface = page.surface();
+    surface.draw_pdf_logical_units(Point::from_xy(20.0, 60.0), &units, font, 24.0, false);
+    surface.finish();
+    page.finish();
+
+    assert!(matches!(
+        document.finish(),
+        Err(krilla::error::KrillaError::Font(_, _))
+    ));
+}
+
 static EXTRACTION_FILE_ID: AtomicU64 = AtomicU64::new(0);
 
-fn extract_logical_pdf(pdf: &[u8], raw: bool) -> Option<String> {
+fn extract_logical_pdf(pdf: &[u8]) -> String {
     let id = EXTRACTION_FILE_ID.fetch_add(1, Ordering::Relaxed);
     let path = std::env::temp_dir().join(format!(
         "krilla-logical-extraction-{}-{id}.pdf",
@@ -504,27 +575,31 @@ fn extract_logical_pdf(pdf: &[u8], raw: bool) -> Option<String> {
     ));
     std::fs::write(&path, pdf).unwrap();
 
-    let mut command = Command::new("pdftotext");
-    command.arg("-enc").arg("UTF-8");
-    if raw {
-        command.arg("-raw");
-    }
-    let output = command.arg(&path).arg("-").output();
+    let output = Command::new("pdftotext")
+        .arg("-enc")
+        .arg("UTF-8")
+        .arg(&path)
+        .arg("-")
+        .output();
     let _ = std::fs::remove_file(&path);
 
     match output {
         Ok(output) if output.status.success() => {
-            Some(String::from_utf8(output.stdout).expect("pdftotext returned invalid UTF-8"))
+            String::from_utf8(output.stdout).expect("pdftotext returned invalid UTF-8")
         }
         Ok(output) => panic!(
             "pdftotext failed: {}",
             String::from_utf8_lossy(&output.stderr)
         ),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            panic!("pdftotext is required for Unicode extraction conformance tests")
+        }
         Err(error) => panic!("failed to run pdftotext: {error}"),
     }
 }
 
+// Remove only controls and page/line separators that Poppler inserts while
+// laying out a page. The authored source text is never normalized or rewritten.
 fn normalize_logical_text(text: &str) -> String {
     let text = text
         .chars()
@@ -542,14 +617,15 @@ fn normalize_logical_text(text: &str) -> String {
     text.trim_end_matches(['\n', '\r']).to_owned()
 }
 
-fn logical_pages(pdf: &[u8], raw: bool) -> Option<Vec<String>> {
-    let text = extract_logical_pdf(pdf, raw)?;
-    Some(
-        text.split('\u{000C}')
-            .map(normalize_logical_text)
-            .filter(|page| !page.is_empty())
-            .collect(),
-    )
+fn logical_pages(pdf: &[u8]) -> Vec<String> {
+    let text = extract_logical_pdf(pdf);
+    // U+000C is the page separator emitted by pdftotext. It is not part of the
+    // authored text and is removed before comparing each page.
+
+    text.split('\u{000C}')
+        .map(normalize_logical_text)
+        .filter(|page| !page.is_empty())
+        .collect()
 }
 
 fn unshaped_logical_pdf(cases: &[(&str, bool)]) -> Vec<u8> {
@@ -629,6 +705,10 @@ fn cluster_logical_pdf(cases: &[&str]) -> Vec<u8> {
     document.finish().unwrap()
 }
 
+#[cfg_attr(
+    not(feature = "unicode-conformance"),
+    ignore = "requires Poppler pdftotext; run with --features unicode-conformance"
+)]
 #[test]
 fn logical_units_preserve_multi_codepoint_clusters() {
     const CASES: &[&str] = &[
@@ -645,12 +725,17 @@ fn logical_units_preserve_multi_codepoint_clusters() {
         "မြန်မာ",
         "བོད་སྐད",
         "😀👨‍👩‍👧‍👦",
+        "ខ្មែរ",
+        "ខ្មែរ\u{200B}",
+        "\u{200B}ខ្មែរ",
+        "e\u{301}",
+        "é",
+        "❤\u{FE0F}",
+        "𝕄",
     ];
 
     let pdf = cluster_logical_pdf(CASES);
-    let Some(pages) = logical_pages(&pdf, false) else {
-        return;
-    };
+    let pages = logical_pages(&pdf);
 
     assert_eq!(pages.len(), CASES.len());
     for (page, expected) in pages.iter().zip(CASES) {
@@ -658,6 +743,24 @@ fn logical_units_preserve_multi_codepoint_clusters() {
     }
 }
 
+#[cfg_attr(
+    not(feature = "unicode-conformance"),
+    ignore = "requires Poppler pdftotext; run with --features unicode-conformance"
+)]
+#[test]
+fn logical_units_share_one_visual_for_distinct_unicode() {
+    const CASES: &[&str] = &["A", "B", "क्ष", "क्ष"];
+
+    let pdf = cluster_logical_pdf(CASES);
+    let pages = logical_pages(&pdf);
+
+    assert_eq!(pages, CASES);
+}
+
+#[cfg_attr(
+    not(feature = "unicode-conformance"),
+    ignore = "requires Poppler pdftotext; run with --features unicode-conformance"
+)]
 #[test]
 fn logical_units_preserve_unicode_for_all_scripts() {
     const CASES: &[(&str, bool)] = &[
@@ -685,9 +788,7 @@ fn logical_units_preserve_unicode_for_all_scripts() {
     ];
 
     let pdf = unshaped_logical_pdf(CASES);
-    let Some(pages) = logical_pages(&pdf, false) else {
-        return;
-    };
+    let pages = logical_pages(&pdf);
 
     assert_eq!(pages.len(), CASES.len());
     for (page, (expected, _)) in pages.iter().zip(CASES) {
@@ -774,6 +875,10 @@ fn shaped_logical_pdf(text: &str, data: Data, direction: Direction) -> Vec<u8> {
     document.finish().unwrap()
 }
 
+#[cfg_attr(
+    not(feature = "unicode-conformance"),
+    ignore = "requires Poppler pdftotext; run with --features unicode-conformance"
+)]
 #[test]
 fn logical_units_preserve_shaped_arabic_and_devanagari() {
     let arabic = "هذا هو سطر عربي بسيط";
@@ -790,12 +895,8 @@ fn logical_units_preserve_shaped_arabic_and_devanagari() {
         Direction::LeftToRight,
     );
 
-    let Some(arabic_pages) = logical_pages(&arabic_pdf, false) else {
-        return;
-    };
-    let Some(devanagari_pages) = logical_pages(&devanagari_pdf, false) else {
-        return;
-    };
+    let arabic_pages = logical_pages(&arabic_pdf);
+    let devanagari_pages = logical_pages(&devanagari_pdf);
 
     assert_eq!(arabic_pages, vec![arabic]);
     assert_eq!(devanagari_pages, vec![devanagari]);

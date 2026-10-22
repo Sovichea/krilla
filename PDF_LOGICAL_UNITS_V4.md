@@ -109,6 +109,15 @@ unsupported fonts. This is a physical-font constraint, not a script constraint:
 Arabic, Indic, Southeast Asian, CJK, combining-mark, RTL, and other scripts use
 the same semantic CID and visual-unit machinery.
 
+Glyph eligibility is checked independently of font eligibility. A TrueType
+font may contain COLR, SVG, or embedded-bitmap glyphs in addition to ordinary
+outline glyphs. The logical path rejects any visual whose source components
+require color rendering instead of silently substituting the monochrome
+outline. The same check covers transitive composite components. Invalid glyph
+IDs, malformed composite data, and unrepresentable metrics also produce a
+controlled font error. The public drawing API remains infallible; errors are
+recorded during content construction and returned by `Document::finish`.
+
 The logical path currently writes horizontal writing mode only. Vertical
 writing, including vertical CJK, still uses the ordinary text path. Exact
 `/ToUnicode` data is producer-side; how a reader orders bidi runs or places
@@ -123,6 +132,12 @@ Each logical-font shard embeds only:
 - transitive component dependencies of referenced composite glyphs; and
 - one synthetic glyph for every unique visual construction that cannot reuse a
   source glyph exactly.
+
+After the final glyph set and horizontal metrics are assembled, the `hhea`
+table is rebuilt for that set. `numberOfHMetrics`, `advanceWidthMax`,
+`minLeftSideBearing`, `minRightSideBearing`, and `xMaxExtent` are derived from
+the final `glyf`, `loca`, and `hmtx` data rather than from the original source
+font.
 
 Source GIDs are remapped densely during subsetting. Synthetic glyphs are then
 appended to that compact source subset. Consequently, a high source GID does
@@ -195,10 +210,22 @@ The implementation is covered by unit tests for:
 - source-backed and synthetic visuals in variable TrueType fonts; and
 - explicit rejection of CFF outlines.
 
-Integration coverage additionally extracts logical text for Latin, Arabic,
-Hebrew, Devanagari, Bengali, Tamil, Telugu, Kannada, Malayalam, Gujarati,
-Gurmukhi, Sinhala, Thai, Lao, Khmer, Myanmar, Tibetan, CJK, combining sequences,
-and emoji from generated PDFs with Poppler `pdftotext`.
+Unicode extraction conformance is mandatory in CI. The dedicated suite uses
+Poppler `pdftotext` and covers Latin, Arabic, Hebrew, Devanagari, Bengali, Tamil,
+Telugu, Kannada, Malayalam, Gujarati, Gurmukhi, Sinhala, Thai, Lao, Khmer,
+Myanmar, Tibetan, CJK, combining sequences, zero-width characters, variation
+selectors, supplementary-plane characters, and emoji. It also covers shaped
+Arabic and Devanagari, multi-codepoint units, and distinct Unicode sharing one
+visual glyph.
+
+Run it locally after installing Poppler:
+
+```text
+cargo test -p tests --features unicode-conformance logical_units
+```
+
+Without the `unicode-conformance` feature these tests are reported as ignored;
+they are never reported as passed when extraction did not run.
 
 The controlled Typst corpus covers English, Khmer, Arabic, Devanagari, and
 mixed multilingual prose. Against Version 3:

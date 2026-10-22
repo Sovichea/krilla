@@ -662,8 +662,6 @@ impl ContentBuilder {
             |_, _, _| {},
             |sb, sc, chunk_container| {
                 action(sb, sc, chunk_container);
-                sb.content.begin_text();
-                sb.content.set_text_rendering_mode(render_mode);
 
                 let font_container = sc.register_font_container(font.clone());
                 let mut mapped = Vec::with_capacity(plans.len());
@@ -682,13 +680,21 @@ impl ContentBuilder {
                         ));
                     }
 
-                    let pdf_glyph = font_container.borrow_mut().add_logical_unit(
+                    match font_container.borrow_mut().add_logical_unit(
                         plan.text.clone(),
                         plan.visual.clone(),
                         plan.location,
-                    );
-                    mapped.push((plan, pdf_glyph));
+                    ) {
+                        Ok(pdf_glyph) => mapped.push((plan, pdf_glyph)),
+                        Err(error) => {
+                            sc.register_error(error);
+                            return;
+                        }
+                    }
                 }
+
+                sb.content.begin_text();
+                sb.content.set_text_rendering_mode(render_mode);
 
                 let upem = font.units_per_em();
                 let mut active_font = None;
