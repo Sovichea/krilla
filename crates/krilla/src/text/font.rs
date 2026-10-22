@@ -26,6 +26,25 @@ use crate::Data;
 #[derive(Clone, Hash, Eq, PartialEq)]
 pub struct Font(Arc<Prehashed<Repr>>);
 
+/// The support a font provides for PDF logical text units.
+///
+/// Logical text units require TrueType `glyf` outlines. Static TrueType fonts,
+/// variable TrueType fonts, and individual faces of TrueType collections are
+/// supported. CFF and CFF2 outlines are not part of this path.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum PdfLogicalUnitSupport {
+    /// The font uses static TrueType `glyf` outlines.
+    TrueType,
+    /// The font uses TrueType `glyf` outlines with variable axes. The logical
+    /// font path instantiates the requested variation coordinates before
+    /// synthesizing glyphs.
+    VariableTrueType,
+    /// The font does not use TrueType `glyf` outlines and cannot be used with
+    /// [`crate::surface::Surface::draw_pdf_logical_units`].
+    Unsupported,
+}
+
 impl Font {
     /// Create a new font from some data. If you want to create a variable font at a specific
     /// location, use [`Font::new_variable`] instead.
@@ -154,6 +173,23 @@ impl Font {
     /// The units per em of the font.
     pub fn units_per_em(&self) -> f32 {
         self.0.font_info.units_per_em as f32
+    }
+
+    /// Return whether this font can be used for PDF logical text units.
+    ///
+    /// The logical-unit path supports TrueType `glyf` outlines, including
+    /// individual faces of TrueType collections and variable TrueType fonts.
+    /// CFF and CFF2 outlines are not supported.
+    pub fn pdf_logical_unit_support(&self) -> PdfLogicalUnitSupport {
+        let font_ref = self.font_ref();
+        if font_ref.glyf().is_err() {
+            return PdfLogicalUnitSupport::Unsupported;
+        }
+        if font_ref.fvar().is_ok() {
+            PdfLogicalUnitSupport::VariableTrueType
+        } else {
+            PdfLogicalUnitSupport::TrueType
+        }
     }
 
     pub(crate) fn bbox(&self) -> Rect {

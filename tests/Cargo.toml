@@ -15,6 +15,7 @@ krilla-svg = { workspace = true }
 krilla = { workspace = true, features = ["raster-images", "simple-text", "pdf"] }
 krilla-macros = { workspace = true }
 fontdb = { workspace = true }
+harfrust = { workspace = true }
 usvg = { workspace = true }
 skrifa = { workspace = true }
 oxipng = { workspace = true }

@@ -409,7 +409,11 @@ impl<'a> Surface<'a> {
     /// shaped visual placement. `PdfLogicalUnit::text` is treated as authoritative for
     /// PDF text extraction and copy/paste.
     ///
-    /// The initial implementation supports embedded static TrueType `glyf` fonts.
+    /// This path supports TrueType `glyf` outlines, including individual faces
+    /// of TrueType collections and variable TrueType fonts. CFF and CFF2 fonts
+    /// must use the ordinary glyph path. Use
+    /// [`crate::text::Font::pdf_logical_unit_support`] to check a font before
+    /// drawing logical units.
     pub fn draw_pdf_logical_units<G: Glyph>(
         &mut self,
         start: Point,

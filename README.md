@@ -20,7 +20,8 @@ without having to worry about low-level details.
 - Blend modes and layer isolation.
 - A high-level text API for rendering sequences of characters.
 - A low-level text API for drawing sequences of positioned glyphs.
-- Authoritative logical PDF text units for preserving source Unicode independently of shaping.
+- Authoritative logical PDF text units for preserving source Unicode independently of shaping
+  (TrueType `glyf` fonts, including collection faces and variable instances).
 - Excellent OpenType font support, supporting all major font types, including color fonts.
 - Linear, radial and sweep gradients, as well as patterns.
 - Embedding bitmap images, and SVG images via `krilla-svg`.

@@ -1906,6 +1906,7 @@ version = "0.0.0"
 dependencies = [
  "difference",
  "fontdb",
+ "harfrust 0.12.0",
  "image 0.25.10",
  "krilla",
  "krilla-macros",

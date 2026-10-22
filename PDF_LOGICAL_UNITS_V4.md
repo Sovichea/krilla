@@ -93,6 +93,27 @@ or changed advance
 The choice is based only on shaped geometry and metrics. It does not inspect or
 special-case the script, language, or Unicode content.
 
+## TrueType font support
+
+Version 4's compact path is deliberately TrueType-only. It supports:
+
+- static TrueType `glyf` fonts;
+- variable TrueType `glyf` fonts, which are instantiated at the requested
+  variation coordinates by the subsetter before the compact font is built; and
+- individual faces of TrueType collections (`.ttc`/`.otc`), selected by the
+  font index.
+
+CFF and CFF2 outlines are not supported by this path. Callers can query
+`Font::pdf_logical_unit_support` and should use the ordinary text path for
+unsupported fonts. This is a physical-font constraint, not a script constraint:
+Arabic, Indic, Southeast Asian, CJK, combining-mark, RTL, and other scripts use
+the same semantic CID and visual-unit machinery.
+
+The logical path currently writes horizontal writing mode only. Vertical
+writing, including vertical CJK, still uses the ordinary text path. Exact
+`/ToUnicode` data is producer-side; how a reader orders bidi runs or places
+combining marks during extraction remains reader-specific.
+
 ## Compact derived font
 
 Each logical-font shard embeds only:
@@ -168,8 +189,16 @@ The implementation is covered by unit tests for:
 - exact source-backed reuse;
 - synthetic fallback for changed advances;
 - synthetic construction from multiple source components;
-- semantic-CID capacity sharding; and
-- compact embedded-GID capacity sharding.
+- semantic-CID capacity sharding;
+- compact embedded-GID capacity sharding;
+- source-backed and synthetic visuals in TrueType collection faces;
+- source-backed and synthetic visuals in variable TrueType fonts; and
+- explicit rejection of CFF outlines.
+
+Integration coverage additionally extracts logical text for Latin, Arabic,
+Hebrew, Devanagari, Bengali, Tamil, Telugu, Kannada, Malayalam, Gujarati,
+Gurmukhi, Sinhala, Thai, Lao, Khmer, Myanmar, Tibetan, CJK, combining sequences,
+and emoji from generated PDFs with Poppler `pdftotext`.
 
 The controlled Typst corpus covers English, Khmer, Arabic, Devanagari, and
 mixed multilingual prose. Against Version 3:

@@ -7,7 +7,7 @@ use subsetter::GlyphRemapper;
 
 use crate::error::{KrillaError, KrillaResult};
 use crate::text::logical::VisualUnitKey;
-use crate::text::{Font, GlyphId};
+use crate::text::{Font, GlyphId, PdfLogicalUnitSupport};
 
 const HEAD: [u8; 4] = *b"head";
 const HHEA: [u8; 4] = *b"hhea";
@@ -130,6 +130,13 @@ pub(crate) fn build_compact_logical_font(
     font: &Font,
     visuals: &[VisualUnitKey],
 ) -> KrillaResult<CompactLogicalFont> {
+    if font.pdf_logical_unit_support() == PdfLogicalUnitSupport::Unsupported {
+        return Err(font_error(
+            font,
+            "PDF logical units require TrueType glyf outlines; CFF and CFF2 fonts are not supported",
+        ));
+    }
+
     let mut source_remapper = GlyphRemapper::new();
     for visual in visuals {
         for component in &visual.components {
@@ -281,10 +288,13 @@ pub(crate) fn synthesize_logical_glyphs(
         return Ok(font.clone());
     }
 
-    if !font.variation_coordinates().is_empty() {
+    // Variable TrueType fonts are instantiated by the subsetter before this
+    // point, so the compact source font and every synthetic glyph use static
+    // outlines for the requested variation coordinates.
+    if font.font_ref().fvar().is_ok() {
         return Err(font_error(
             font,
-            "PDF logical units are not yet supported for variable TrueType fonts",
+            "compact logical font still contains variable axes",
         ));
     }
 
@@ -689,21 +699,53 @@ fn serialize_loca(offsets: &[u32]) -> Vec<u8> {
     out
 }
 
+fn sfnt_face_offset(data: &[u8], index: u32, font: &Font) -> KrillaResult<usize> {
+    if data.get(..4) != Some(b"ttcf") {
+        if index != 0 {
+            return Err(font_error(font, "font index is out of range"));
+        }
+        return Ok(0);
+    }
+
+    let version = read_u32(data, 4, font)?;
+    if version != 0x0001_0000 && version != 0x0002_0000 {
+        return Err(font_error(font, "unsupported TrueType collection version"));
+    }
+    let num_fonts = read_u32(data, 8, font)?;
+    if index >= num_fonts {
+        return Err(font_error(font, "font index is out of range"));
+    }
+    let record = usize::try_from(index)
+        .ok()
+        .and_then(|index| index.checked_mul(4))
+        .and_then(|offset| offset.checked_add(12))
+        .ok_or_else(|| font_error(font, "TrueType collection face index overflow"))?;
+    let offset = read_u32(data, record, font)?;
+    let offset = usize::try_from(offset)
+        .map_err(|_| font_error(font, "TrueType collection face offset does not fit usize"))?;
+    let header_end = offset
+        .checked_add(12)
+        .ok_or_else(|| font_error(font, "TrueType collection face offset overflow"))?;
+    if header_end > data.len() {
+        return Err(font_error(
+            font,
+            "TrueType collection face offset exceeds font data",
+        ));
+    }
+    Ok(offset)
+}
+
 impl ParsedFont {
     fn parse(data: &[u8], font: &Font) -> KrillaResult<Self> {
         if data.len() < 12 {
             return Err(font_error(font, "font is too short"));
         }
-        if data.get(..4) == Some(b"ttcf") {
-            return Err(font_error(
-                font,
-                "PDF logical units do not yet support TrueType collections",
-            ));
-        }
-        let scaler_type = read_u32(data, 0, font)?;
-        let count = usize::from(read_u16(data, 4, font)?);
-        let directory_len = 12_usize
-            .checked_add(count.saturating_mul(16))
+        let face_offset = sfnt_face_offset(data, font.index(), font)?;
+        let scaler_type = read_u32(data, face_offset, font)?;
+        let count = usize::from(read_u16(data, face_offset + 4, font)?);
+        let directory_len = face_offset
+            .checked_add(12)
+            .and_then(|offset| offset.checked_add(count.saturating_mul(16)))
             .ok_or_else(|| font_error(font, "table directory overflow"))?;
         if directory_len > data.len() {
             return Err(font_error(font, "table directory exceeds font data"));
@@ -711,7 +753,7 @@ impl ParsedFont {
 
         let mut tables = BTreeMap::new();
         for index in 0..count {
-            let record = 12 + index * 16;
+            let record = face_offset + 12 + index * 16;
             let tag: [u8; 4] = data[record..record + 4].try_into().unwrap();
             let offset = usize::try_from(read_u32(data, record + 8, font)?)
                 .map_err(|_| font_error(font, "table offset does not fit usize"))?;
@@ -897,11 +939,55 @@ fn font_error(font: &Font, message: &str) -> KrillaError {
 mod tests {
     use super::build_compact_logical_font;
     use crate::text::logical::{LogicalComponent, VisualUnitKey};
-    use crate::text::{Font, GlyphId};
+    use crate::text::{Font, GlyphId, PdfLogicalUnitSupport, Tag};
 
     fn font() -> Font {
         let data = include_bytes!("../../../../assets/fonts/NotoSans-Regular.ttf");
         Font::new(data.as_slice().into(), 0).unwrap()
+    }
+
+    fn variable_font(weight: f32) -> Font {
+        let data = include_bytes!("../../../../assets/fonts/NotoSans_variable.ttf");
+        Font::new_variable(data.as_slice().into(), 0, &[(Tag::new(b"wght"), weight)]).unwrap()
+    }
+
+    fn variable_default_font() -> Font {
+        let data = include_bytes!("../../../../assets/fonts/NotoSans_variable.ttf");
+        Font::new(data.as_slice().into(), 0).unwrap()
+    }
+
+    fn collection_from(data: &[u8]) -> Vec<u8> {
+        const HEADER_LEN: usize = 20;
+        assert_eq!(data.get(..4), Some(&b"\0\x01\0\0"[..]));
+
+        let count = u16::from_be_bytes(data[4..6].try_into().unwrap()) as usize;
+        let mut first_face = data.to_vec();
+        let mut second_face = data.to_vec();
+        for face in [&mut first_face, &mut second_face] {
+            for index in 0..count {
+                let record = 12 + index * 16 + 8;
+                let offset =
+                    u32::from_be_bytes(face[record..record + 4].try_into().unwrap()) as usize;
+                let adjusted = u32::try_from(offset + HEADER_LEN).unwrap();
+                face[record..record + 4].copy_from_slice(&adjusted.to_be_bytes());
+            }
+        }
+
+        let second_offset = HEADER_LEN + first_face.len();
+        let mut collection = Vec::with_capacity(second_offset + second_face.len());
+        collection.extend_from_slice(b"ttcf");
+        collection.extend_from_slice(&0x0001_0000_u32.to_be_bytes());
+        collection.extend_from_slice(&2_u32.to_be_bytes());
+        collection.extend_from_slice(&(HEADER_LEN as u32).to_be_bytes());
+        collection.extend_from_slice(&(second_offset as u32).to_be_bytes());
+        collection.extend_from_slice(&first_face);
+        collection.extend_from_slice(&second_face);
+        collection
+    }
+
+    fn collection_font(index: u32) -> Font {
+        let data = include_bytes!("../../../../assets/fonts/NotoSans-Regular.ttf");
+        Font::new(collection_from(data).into(), index).unwrap()
     }
 
     fn source_visual(font: &Font, glyph_id: u32) -> VisualUnitKey {
@@ -954,5 +1040,73 @@ mod tests {
 
         assert_eq!(compact.font.num_glyphs(), 4);
         assert_eq!(compact.visual_gids, vec![1, 3]);
+    }
+
+    #[test]
+    fn true_type_collection_faces_are_supported() {
+        for index in 0..2 {
+            let font = collection_font(index);
+            assert_eq!(
+                font.pdf_logical_unit_support(),
+                PdfLogicalUnitSupport::TrueType
+            );
+            let compact = build_compact_logical_font(&font, &[source_visual(&font, 36)]).unwrap();
+
+            assert_eq!(compact.font.num_glyphs(), 2);
+            assert_eq!(compact.visual_gids, vec![1]);
+        }
+    }
+
+    #[test]
+    fn true_type_collection_faces_can_synthesize_visuals() {
+        let font = collection_font(1);
+        let mut visual = source_visual(&font, 36);
+        visual.advance_width -= 1;
+        let compact = build_compact_logical_font(&font, &[visual]).unwrap();
+
+        assert_eq!(compact.font.num_glyphs(), 3);
+        assert_eq!(compact.visual_gids, vec![2]);
+    }
+
+    #[test]
+    fn variable_true_type_fonts_are_supported() {
+        for font in [variable_font(700.0), variable_default_font()] {
+            assert_eq!(
+                font.pdf_logical_unit_support(),
+                PdfLogicalUnitSupport::VariableTrueType
+            );
+
+            let compact = build_compact_logical_font(&font, &[source_visual(&font, 36)]).unwrap();
+            assert_eq!(compact.font.num_glyphs(), 2);
+            assert_eq!(compact.visual_gids, vec![1]);
+        }
+    }
+
+    #[test]
+    fn variable_true_type_fonts_can_synthesize_visuals() {
+        let font = variable_font(700.0);
+        let mut visual = source_visual(&font, 36);
+        visual.advance_width -= 1;
+        let compact = build_compact_logical_font(&font, &[visual]).unwrap();
+
+        assert_eq!(compact.font.num_glyphs(), 3);
+        assert_eq!(compact.visual_gids, vec![2]);
+    }
+
+    #[test]
+    fn cff_and_cff2_fonts_report_unsupported_logical_units() {
+        let cff = include_bytes!("../../../../assets/fonts/LatinModernRoman-Regular.otf");
+        let cff2 = include_bytes!("../../../../assets/fonts/Cantarell-VF.otf");
+
+        for font in [
+            Font::new(cff.as_slice().into(), 0).unwrap(),
+            Font::new(cff2.as_slice().into(), 0).unwrap(),
+        ] {
+            assert_eq!(
+                font.pdf_logical_unit_support(),
+                PdfLogicalUnitSupport::Unsupported
+            );
+            assert!(build_compact_logical_font(&font, &[]).is_err());
+        }
     }
 }
