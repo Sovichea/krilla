@@ -67,9 +67,11 @@ jobs:
 
       - name: Install pdfcpu
         run: |
-          git clone https://github.com/LaurenzV/pdfcpu /tmp/pdfcpu
+          git init /tmp/pdfcpu
+          git -C /tmp/pdfcpu remote add origin https://github.com/LaurenzV/pdfcpu
+          git -C /tmp/pdfcpu fetch --depth=1 origin 4639fc2effa010b959b4dcb77c99a16020d238fb
+          git -C /tmp/pdfcpu checkout FETCH_HEAD
           cd /tmp/pdfcpu
-          git checkout 4639fc2
           go install ./cmd/pdfcpu
 
       - name: Validate store PDFs with pdfcpu
